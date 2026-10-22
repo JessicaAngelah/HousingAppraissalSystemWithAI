@@ -1,7 +1,9 @@
-# Sistem Penilaian Agunan Properti (Interactive, Python/Streamlit)
+# Sistem Penilaian Agunan Properti (Python / Streamlit)
 
-Aplikasi web interaktif (bukan CLI) untuk alur penilaian properti 10 langkah,
-dari input data properti sampai Laporan Penilaian Agunan (LPA).
+Aplikasi web interaktif (bukan CLI) untuk alur penilaian properti **11 langkah**,
+dari input data properti sampai Laporan Penilaian Agunan (LPA). Semua
+dilakukan lewat form, tombol, peta, dan slider. Antarmuka tersedia dalam
+**Bahasa Indonesia** dan **English** (tombol di pojok atas sidebar).
 
 ## Instalasi
 
@@ -10,8 +12,11 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-`playwright install chromium` wajib dijalankan sekali agar Step 2 bisa
-membuka browser headless yang scraping data ZNT asli dari Bhumi ATR/BPN.
+`playwright install chromium` wajib dijalankan sekali agar Step 2 bisa membuka
+browser headless untuk mengambil data ZNT asli dari Bhumi ATR/BPN.
+
+> **Windows:** kalau perintah `pip` atau `playwright` tidak dikenali, pakai
+> `py -m pip install -r requirements.txt` dan `py -m playwright install chromium`.
 
 ## Menjalankan
 
@@ -19,150 +24,200 @@ membuka browser headless yang scraping data ZNT asli dari Bhumi ATR/BPN.
 streamlit run app.py
 ```
 
-Ini akan membuka jendela browser dengan antarmuka interaktif — tidak ada
-interaksi command line, semua lewat form, tombol, dan slider.
+**Kalau muncul error `streamlit is not recognized` / `command not found`**
+(biasanya karena Streamlit sudah terpasang tapi folder Scripts belum ada di
+PATH), jalankan lewat Python:
+
+```bash
+py -m streamlit run app.py
+```
+
+Alternatif: `python -m streamlit run app.py` (atau `python3 -m streamlit run app.py`
+di macOS/Linux).
+
+Browser akan terbuka otomatis. Kalau tidak, buka alamat yang tampil di
+terminal (biasanya http://localhost:8501).
 
 ## API Keys
 
 Buka sidebar **⚙️ API Keys** di kiri layar dan isi:
 
-- **Serper API Key** — https://serper.dev — dipakai untuk pencarian web
-  (Bhumi ZNT Agent, Pinpoint Screening Agent, Property Reference Agent).
-- **Groq API Key** — https://console.groq.com — LLM cepat untuk
-  ekstraksi/analisis data terstruktur (diprioritaskan jika keduanya diisi).
-- **Gemini API Key** — https://aistudio.google.com/apikey — LLM cadangan
-  jika Groq key tidak diisi.
+| Key | Link | Fungsi |
+| --- | --- | --- |
+| **Serper API Key** | https://serper.dev | Pencarian web (Bhumi ZNT Agent cadangan, Pinpoint Screening Agent, Property Reference Agent) |
+| **Groq API Key** | https://console.groq.com | LLM utama untuk ekstraksi/analisis data (diprioritaskan kalau keduanya diisi) |
+| **Gemini API Key** | https://aistudio.google.com/apikey | LLM cadangan kalau Groq kosong, perapih data ZNT, dan **satu-satunya** yang bisa membaca foto (AI OCR Step 3) |
 
-Key disimpan hanya di session Streamlit (memori, selama tab dibuka) — tidak
-ditulis ke disk. Anda tidak wajib mengisi semua tiga; sistem tetap berjalan
-dan meminta input manual di step yang tidak punya key.
+Tidak wajib mengisi ketiganya. Sistem tetap berjalan dan meminta input manual
+di langkah yang tidak punya key. **Step 4** menampilkan kotak
+**"API Key yang sudah ditambahkan"** (✅ terisi / ⚠️ belum diisi) sebelum
+analisis berjalan, jadi Anda langsung tahu key mana yang masih kurang.
 
-## Alur 10 Step
+### Supaya tidak mengetik key berulang kali (opsional)
 
-1. Input Data Properti
-2. Nilai Tanah (Bhumi ZNT Agent) — pencarian web + estimasi LLM, dengan
-   koreksi manual
-3. Nilai Bangunan (Cost Approach)
-4. Analisis Faktor Pengurang (Pinpoint Screening Agent + checklist manual)
-5. Nilai Pasar Awal
-6. Property Reference AI (pencarian listing dari beberapa situs + ekstraksi LLM)
-7. Validasi Nilai Pasar
-8. Nilai Likuidasi
-9. Analisis NJOP
-10. Laporan Penilaian Agunan (LPA) — bisa diunduh sebagai file Markdown
+Key yang diketik di sidebar hanya tersimpan di session Streamlit (memori,
+selama tab dibuka) dan tidak ditulis ke disk. Untuk mengisi otomatis, pakai
+salah satu cara berikut (urutan prioritas):
 
-## Catatan Penting / Keterbatasan
+1. **`.streamlit/secrets.toml`** (disarankan, juga untuk deploy ke Streamlit
+   Community Cloud). Buat file ini di folder proyek:
 
-- **Step 2 sekarang mengambil data ZNT ASLI** langsung dari peta interaktif
-  Bhumi ATR/BPN memakai `bhumi_agent.py` (Playwright, browser headless):
-  1. Kalau Step 1 tidak diisi lat/lon manual, sistem geocode alamat dulu
-     lewat OpenStreetMap Nominatim (gratis, tanpa API key).
-  2. `BhumiZntAgent` membuka https://bhumi.atrbpn.go.id/peta, mengaktifkan
-     layer "Zona Nilai Tanah", mencari koordinat, klik marker, dan membaca
-     popup (Nomor Zone, Range Nilai, Tahun Dibuat, dst).
-  3. Kalau Gemini key diisi, teks popup dirapikan jadi JSON oleh Gemini
-     (`google-genai`); kalau tidak, dipakai parser regex bawaan
-     (`parse_standard_znt_fields`) sebagai fallback — hasilnya tetap valid.
-  4. Kalau scraping gagal (situs berubah, Playwright belum terpasang,
-     koordinat di luar layer ZNT, dll), sistem otomatis fallback ke
-     estimasi lama (pencarian web via Serper + LLM) dengan confidence
-     level yang jujur ditandai lebih rendah, dan field tetap bisa dikoreksi
-     manual.
-  - Tombol **"🔄 Ambil ulang data ZNT"** di Step 2 berguna kalau geocoding
-    alamat kurang presisi — perbaiki lat/lon di Step 1 (mode "Manual
-    Latitude & Longitude"), lalu ulangi Step 2.
-  - Scraping butuh browser Chromium headless, jadi Step 2 bisa makan waktu
-    ~20-40 detik dan butuh koneksi keluar (outbound) ke bhumi.atrbpn.go.id.
-- **Step 1 — Harga yang Diajukan (opsional).** Field baru untuk mencatat
-  harga penawaran/klaim pemilik, dipakai untuk perbandingan otomatis di
-  Step 10.
-- **Step 10 (baru) — Perbandingan Harga & Depresiasi Final**, sebelum
-  Laporan Agunan:
-  - Menampilkan tabel Umur Ekonomis/Manfaat & Penyusutan per Tahun dari
-    Biaya Teknis Bangunan (BTB) MAPPI 2023 (Rumah Sederhana 5%/20th, Rumah
-    Menengah 3.33%/30th, Rumah Mewah 2%/50th, Pabrik/Gudang 3.33%/30th,
-    Toko/Kios 5%/20th) sebagai referensi SOP.
-  - Membandingkan Harga yang Diajukan (Step 1) vs Nilai Pasar Akhir hasil
-    appraisal.
-  - Kalkulator Penyusutan Persentase FINAL: Asset Value default dari Nilai
-    Bangunan Step 3, persentase default otomatis mengikuti tabel MAPPI
-    berdasarkan klasifikasi bangunan (appraiser bisa timpa manual jenis
-    bangunan/persentase), dan Period bisa dalam satuan Tahun ATAU Bulan
-    (kalau Bulan, persentase tahunan otomatis dibagi 12 per periode).
-  - Laporan (Step 11) sekarang menyertakan bagian "9b. Perbandingan Harga &
-    Depresiasi Final" merangkum hasil ini.
-- **Step 1 — Lokasi Properti kini sepenuhnya berfungsi**, tiga mode:
-  - **Search Address**: tombol "🔍 Cari" men-geocode alamat/teks pencarian
-    (Nominatim) dan menampilkan Latitude/Longitude hasil pencarian secara
-    eksplisit.
-  - **Pinpoint on Map**: peta interaktif (folium + streamlit-folium) - klik
-    di peta untuk menandai lokasi persis; koordinat yang dipilih ditampilkan
-    di bawah peta. Ada kotak pencarian terpisah untuk memindahkan tampilan
-    peta ke area tertentu dulu sebelum klik presisi. Butuh `folium` &
-    `streamlit-folium` (sudah ditambahkan ke requirements.txt).
-  - **Manual Latitude & Longitude**: input angka langsung seperti sebelumnya.
-  - Titik yang sudah dipilih tersimpan di session state dan tetap ada
-    walau berpindah mode input.
-- **Gemini API — retry otomatis untuk error 429 (Too Many Requests) & 503**:
-  `GeminiClient` sekarang mencoba ulang otomatis dengan jeda meningkat
-  (2s → 4s → 8s) sebelum menyerah. Kalau tetap gagal, pesan error menjelaskan
-  bahwa ini rate limit/kuota API key (bukan bug aplikasi) dan menyarankan
-  mencoba lagi nanti atau memeriksa kuota di Google AI Studio. Ini berlaku
-  untuk fitur AI OCR foto rumah (Step 3) maupun panggilan Gemini lainnya.
-- **Step 3 — AI OCR Klasifikasi & Umur Bangunan (opsional).** Unggah foto
-  tampak depan rumah, Gemini vision akan memperkirakan klasifikasi
-  (Sederhana/Menengah/Mewah) dan umur bangunan (tahun). Ini alat bantu
-  pengisian awal saja — appraiser tetap wajib verifikasi lapangan. Butuh
-  Gemini API key (Groq tidak mendukung gambar).
-- **Step 3 — Dua metode penyusutan bangunan:** Garis Lurus (default lama)
-  atau Persentase Tetap / Declining Balance (baru) — yang terakhir
-  menampilkan jadwal penyusutan (depreciation schedule) tahun per tahun:
-  `Depreciation = Beginning Value × Percentage`, `Balance = Beginning Value − Depreciation`.
-- **Pinpoint peta interaktif** (klik di peta) belum diimplementasikan;
-  gunakan mode "Manual Latitude & Longitude" di Step 1, atau tambahkan
-  komponen `streamlit-folium` jika ingin peta klik-untuk-pin.
-- **Property Reference AI (Step 6)** mengandalkan hasil pencarian Google (via
-  Serper) yang menyebut Rumah123/99.co/OLX/Pinhome, lalu LLM mengekstrak data
-  harga dari cuplikan snippet — termasuk tanggal listing itu diunggah/
-  diperbarui (bukan tanggal sistem melakukan scraping). Ini bukan scraping
-  resmi ke masing-masing situs (yang umumnya memblokir scraping otomatis),
-  jadi hasilnya bisa tidak lengkap — selalu ada opsi "Tambah properti
-  pembanding manual".
-  - Tiap pembanding di-geocode (Nominatim) untuk menghitung jarak ke
-    properti subjek. Kriteria default: luas tanah/bangunan dalam ±20% dari
-    subjek DAN jarak ≤ 5 km (radius dan toleransi luas bisa dikustomisasi
-    di UI sebelum pencarian). Pembanding di luar kriteria tetap ditampilkan
-    (ditandai badge merah) tapi tidak otomatis dicentang.
-  - Similarity score sekarang menitikberatkan pada kedekatan JARAK (70%)
-    dibanding kemiripan luas (30%) — pembanding TERDEKAT diprioritaskan,
-    bukan lagi yang paling mirip luasnya.
-  - Ditampilkan juga median harga/m² dari seluruh pembanding tercentang,
-    diproyeksikan ke luas tanah subjek (mis. "median 12 pembanding → Rp
-    X/m² × 120 m² = Rp Y").
-- **Step 7 — Rentang Nilai Pasar.** Selain Nilai Pasar Akhir (titik
-  tunggal), sistem sekarang juga menampilkan RENTANG nilai pasar
-  (mempertimbangkan baik Nilai Pasar Awal internal maupun sebaran
-  minimum-maximum pembanding) — berguna saat kedua angka berbeda jauh,
-  mis. internal Rp500jt vs pembanding Rp900jt → rentang Rp500jt–Rp900jt,
-  plus satu titik estimasi untuk keperluan yang butuh angka tunggal.
-- **Step 8 — Nilai Likuidasi kini berupa RENTANG** (bukan satu angka),
-  memakai rentang rasio likuidasi yang bisa disesuaikan (default sekitar
-  ±7-8% dari rasio proxy status sertifikat).
-- **Step 10 — Laporan** kini juga membandingkan Harga Tanah per m² (ZNT
-  subjek vs average/median/min/max pembanding), dan menampilkan rentang
-  nilai pasar & nilai likuidasi (bukan hanya titik tunggal).
+   ```toml
+   SERPER_API_KEY = "isi-key-anda"
+   GROQ_API_KEY   = "isi-key-anda"
+   GEMINI_API_KEY = "isi-key-anda"
+   ```
+
+2. **Environment variable** dengan nama yang sama, contoh di Windows
+   PowerShell:
+
+   ```powershell
+   $env:SERPER_API_KEY="isi-key-anda"
+   py -m streamlit run app.py
+   ```
+
+   atau di macOS/Linux: `SERPER_API_KEY=isi-key-anda streamlit run app.py`
+
+> Jangan commit `secrets.toml` atau key Anda ke Git.
+
+## Alur 11 Step
+
+1. **Input Data Properti** — isi manual, atau impor dari file Excel/CSV.
+   Lokasi punya 3 mode: *Search Address*, *Pinpoint on Map*, dan *Manual
+   Latitude & Longitude*.
+2. **Nilai Tanah (Bhumi ZNT)** — data ZNT asli dari Bhumi ATR/BPN, dengan
+   koreksi manual.
+3. **Nilai Bangunan (Cost Approach)** — penyusutan Garis Lurus atau
+   Persentase Tetap (Declining Balance), plus AI OCR foto rumah (opsional).
+4. **Faktor Pengurang** — peta & data GIS lokasi, Pinpoint Screening Agent,
+   dan checklist manual.
+5. **Nilai Pasar Awal**
+6. **Property Reference AI** — pencarian properti pembanding dari beberapa
+   situs.
+7. **Perbandingan Harga Tanah per m²** — average / median / minimum / maximum
+   pembanding.
+8. **Validasi & Rentang Nilai Pasar**
+9. **Hasil Appraisal: Perbandingan Harga** — perbandingan pendekatan
+   Referensi, ZNT, dan Internal Final.
+10. **Nilai Likuidasi** — berupa rentang.
+11. **Laporan Penilaian Agunan (LPA)** — dapat diunduh sebagai file Markdown.
+
+## Fitur Utama per Step
+
+### Step 1 — Input & Lokasi
+- **Impor Excel/CSV** (`excel_import.py`): siapkan banyak properti di
+  spreadsheet lalu pilih barisnya di app. Nama kolom fleksibel asal
+  mengandung salah satu kata: Alamat, Lokasi (format `lat, lon`), Dokumen,
+  Data Bangunan (teks `Tahun bangun: YYYY` otomatis terbaca), Luas Tanah,
+  Luas Bangunan. Tidak butuh API key.
+- **Search Address**: tombol "🔍 Cari" men-geocode alamat (OpenStreetMap
+  Nominatim) dan menampilkan Latitude/Longitude hasilnya.
+- **Pinpoint on Map**: peta interaktif (folium + streamlit-folium), klik di
+  peta untuk menandai lokasi persis. Ada kotak pencarian terpisah untuk
+  memindahkan tampilan peta dulu sebelum klik presisi.
+- **Manual Latitude & Longitude**: input angka langsung.
+- Titik yang sudah dipilih tetap tersimpan walau berpindah mode.
+- **Harga yang Diajukan** (opsional): harga penawaran/klaim pemilik, dipakai
+  untuk perbandingan otomatis di langkah-langkah berikutnya.
+
+### Step 2 — Nilai Tanah (Bhumi ZNT)
+`bhumi_agent.py` (Playwright, browser headless) membuka
+https://bhumi.atrbpn.go.id/peta, mengaktifkan layer "Zona Nilai Tanah",
+mencari koordinat, klik marker, lalu membaca popup (Nomor Zone, Range Nilai,
+Tahun Dibuat, dst).
+
+- Kalau lat/lon belum diisi, alamat di-geocode dulu lewat Nominatim.
+- Kalau Gemini key diisi, teks popup dirapikan jadi JSON oleh Gemini; kalau
+  tidak, dipakai parser regex bawaan (`parse_standard_znt_fields`).
+- Kalau scraping gagal (situs berubah, Playwright belum terpasang, koordinat
+  di luar layer ZNT, dll), otomatis fallback ke estimasi web (Serper) + LLM
+  dengan confidence level yang ditandai lebih rendah. Field tetap bisa
+  dikoreksi manual.
+- Tombol **"🔄 Ambil ulang data ZNT"** berguna kalau geocoding kurang presisi:
+  perbaiki lat/lon di Step 1, lalu ulangi Step 2.
+- Scraping butuh Chromium headless dan koneksi keluar ke
+  `bhumi.atrbpn.go.id`, jadi bisa makan waktu sekitar 20-40 detik.
+
+### Step 3 — Nilai Bangunan
+- Dua metode penyusutan: **Garis Lurus**, atau **Persentase Tetap / Declining
+  Balance** yang menampilkan jadwal penyusutan tahun per tahun
+  (`Depreciation = Beginning Value × Percentage`,
+  `Balance = Beginning Value − Depreciation`).
+- **AI OCR foto rumah (opsional)**: unggah satu atau beberapa foto (tampak
+  depan, samping, belakang), Gemini vision memperkirakan klasifikasi
+  (Sederhana/Menengah/Mewah) dan umur bangunan. Ini hanya alat bantu
+  pengisian awal, appraiser tetap wajib verifikasi lapangan. Butuh Gemini
+  API key (Groq tidak mendukung gambar).
+
+### Step 4 — Faktor Pengurang
+- **Data GIS sungguhan** (`gis_data.py`): OpenStreetMap lewat Overpass API
+  (minimarket, rumah sakit, sekolah, pasar, tempat ibadah, rel kereta, SUTET,
+  kawasan industri, makam, TPA, sungai/kanal, dan jalan terdekat), indeks
+  bahaya resmi BNPB InaRISK (banjir, longsor, gempa), plus Google Street View.
+  Gratis dan tanpa API key.
+- Kalau data GIS gagal diambil, otomatis fallback ke analisis web (Serper) +
+  LLM (**Pinpoint Screening Agent**).
+- Checklist manual ikut terisi sebagian secara otomatis (mis. legalitas dari
+  status sertifikat, akses jalan dari data GIS), dan semuanya tetap bisa
+  diubah.
+
+### Step 6 — Property Reference AI
+Mengandalkan hasil pencarian Google (via Serper) yang menyebut
+Rumah123/99.co/OLX/Pinhome, lalu LLM mengekstrak data harga dari cuplikan
+snippet, termasuk tanggal listing diunggah/diperbarui. Ini **bukan** scraping
+resmi ke situs-situs tersebut, jadi hasilnya bisa tidak lengkap. Selalu ada
+opsi **"Tambah properti pembanding manual"**.
+
+- Tiap pembanding di-geocode untuk menghitung jarak ke properti subjek.
+- Kriteria default: luas tanah/bangunan dalam ±20% dari subjek **dan** jarak
+  ≤ 5 km (bisa diubah di UI sebelum pencarian). Pembanding di luar kriteria
+  tetap ditampilkan (badge merah) tetapi tidak otomatis dicentang.
+- Similarity score menitikberatkan **jarak (70%)** dibanding kemiripan luas
+  (30%), jadi pembanding terdekat diprioritaskan.
+- Ditampilkan juga median harga/m² dari semua pembanding tercentang,
+  diproyeksikan ke luas tanah subjek.
+
+### Step 8 — Rentang Nilai Pasar
+Selain Nilai Pasar Akhir (titik tunggal), sistem menampilkan **rentang**
+nilai pasar (mempertimbangkan Nilai Pasar Awal internal dan sebaran
+minimum-maximum pembanding). Berguna saat kedua angka berbeda jauh, mis.
+internal Rp500jt vs pembanding Rp900jt menghasilkan rentang Rp500jt-Rp900jt,
+plus satu titik estimasi bila butuh angka tunggal.
+
+### Step 10 & 11 — Likuidasi & Laporan
+- Nilai Likuidasi berupa **rentang** (default sekitar ±7-8% dari rasio proxy
+  status sertifikat, bisa disesuaikan).
+- Laporan memuat perbandingan Harga Tanah per m², rentang nilai pasar, dan
+  rentang nilai likuidasi. Tombol **"🔄 Mulai Penilaian Baru"** menghapus data
+  penilaian tetapi mempertahankan API key di sidebar.
+- Tabel Umur Ekonomis & Penyusutan per Tahun mengacu pada Biaya Teknis
+  Bangunan (BTB) MAPPI 2023 (Rumah Sederhana 5%/20th, Menengah 3,33%/30th,
+  Mewah 2%/50th, Pabrik/Gudang 3,33%/30th, Toko/Kios 5%/20th).
+
+## Catatan & Keterbatasan
+
+- **Gemini retry otomatis**: untuk error 429 (Too Many Requests) dan 503,
+  `GeminiClient` mencoba ulang dengan jeda bertahap (2s → 4s → 8s). Kalau
+  tetap gagal, pesan error menjelaskan bahwa ini rate limit/kuota API key
+  (bukan bug aplikasi); coba lagi nanti atau cek kuota di Google AI Studio.
 - Semua rumus (nilai tanah, cost approach, faktor pengurang, validasi,
-  likuidasi, NJOP) ada di `calculations.py` dan berjalan murni lokal
-  (tidak butuh API key), sehingga bisa dites/diubah terpisah dari bagian AI.
+  likuidasi, NJOP) ada di `calculations.py` dan berjalan murni lokal tanpa
+  API key, sehingga bisa dites/diubah terpisah dari bagian AI.
+- Hasil AI (OCR foto, estimasi web, checklist otomatis) hanya alat bantu.
+  Appraiser tetap wajib memverifikasi.
 
 ## Struktur File
 
 ```
-app.py            - antarmuka Streamlit (wizard 10 step)
-agents.py          - orkestrasi Serper + Groq/Gemini + BhumiZntAgent per step
+app.py              - antarmuka Streamlit (wizard 11 step)
+agents.py           - orkestrasi Serper + Groq/Gemini + BhumiZntAgent per step
 bhumi_agent.py      - scraper Playwright untuk data ZNT asli dari Bhumi ATR/BPN
+gis_data.py         - data GIS Step 4 (OpenStreetMap Overpass, BNPB InaRISK, Street View)
 geocode.py          - geocoding alamat -> lat/lon (OpenStreetMap Nominatim)
+excel_import.py     - impor data properti dari Excel/CSV untuk Step 1
 api_clients.py      - wrapper API Serper / Groq / Gemini
 calculations.py     - rumus-rumus penilaian (murni Python, testable)
-requirements.txt
+requirements.txt    - dependensi Python
+packages.txt        - dependensi sistem Linux untuk Chromium (deploy Streamlit Cloud)
+CONTINUE_PROMPT.md  - catatan konteks untuk melanjutkan pengembangan
 ```
