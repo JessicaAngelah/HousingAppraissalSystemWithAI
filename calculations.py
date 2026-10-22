@@ -63,6 +63,14 @@ MAPPI_UMUR_EKONOMIS_TABLE = {
 # Tabel klasifikasi bangunan (dipakai di Step 3) - kriteria luas bangunan, umur
 # ekonomis, rate penyusutan/tahun, dan default Biaya Reproduksi Baru (BRB) per m².
 # Sesuai SOP.
+# Default/rata-rata Biaya Reproduksi Baru (BRB) per m² dipakai di seluruh app
+# (nilai awal field "Biaya Reproduksi Baru / m²" di Step 3, dan estimasi Harga
+# Bangunan pembanding di Step 6) kalau appraiser belum mengisi/mengubahnya
+# sendiri. Sumber: BTB MAPPI 2025 x IKK BPS 2025 (file "Estimasi BTB2025 x
+# IKK2025"), sheet BTB_2025, Kota Surabaya (kota anchor IKK 2025 = 100),
+# kolom "R. Tinggal Menengah (Rp/m², incl. PPN)" = Rp 5.330.000.
+BRB_DEFAULT_PER_M2 = 5_330_000
+
 KLASIFIKASI_BANGUNAN_TABLE = {
     "Sederhana": {
         "kriteria": "LB ≤ 36m² atau subsidi",
@@ -593,6 +601,7 @@ def _dalam_toleransi(nilai_subjek, nilai_pembanding, toleransi_pct: float) -> bo
 def memenuhi_kriteria_pembanding(
     subjek: dict, pembanding: dict, radius_km: float = 5.0,
     luas_tanah_toleransi_pct: float = 0.20, luas_bangunan_toleransi_pct: float = 0.20,
+
 ) -> dict:
     """
     Cek kriteria pembanding SESUAI kebijakan baru:

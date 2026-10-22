@@ -23,7 +23,9 @@ from geocode import (
     geocode_address, geocode_search, geocode_search_with_places_fallback,
     geocode_search_gmaps_style, reverse_geocode,
 )
+from excel_import import parse_property_excel
 import calculations as calc
+import gis_data
 
 st.set_page_config(page_title="Sistem Penilaian Agunan Properti", layout="wide")
 
@@ -67,7 +69,7 @@ def init_state():
         "faktor_pengurang": {},
         "nilai_pasar_awal": 0,
         "comparables": [],   # Step 6
-        "comparable_count": 15,
+        "comparable_count": 5,
         "radius_km": 5.0,          # Step 6 - radius maksimum pencarian pembanding
         "luas_tanah_toleransi_pct": 0.20,      # Step 6 - toleransi luas tanah +/-20% (default)
         "luas_bangunan_toleransi_pct": 0.20,   # Step 6 - toleransi luas bangunan +/-20% (default)
@@ -168,7 +170,6 @@ with st.sidebar:
     serper_key = st.text_input("Serper API Key", type="password", key="serper_key")
     groq_key = st.text_input("Groq API Key", type="password", key="groq_key")
     gemini_key = st.text_input("Gemini API Key", type="password", key="gemini_key")
-
     st.divider()
     st.header(t("Progress", "Progress"))
     steps_label = [
@@ -223,6 +224,79 @@ if st.session_state.step == 1:
     kecamatan = st.session_state.get("step1_kecamatan", "")
     alamat = st.session_state.get("step1_alamat", "")
 
+    # -----------------------------------------------------------------
+    # Import dari Excel/CSV: appraiser bisa siapkan banyak properti sekaligus
+    # di satu file (header kolom bebas - cukup memuat kata "Alamat", "Lokasi",
+    # "Dokumen", "Data Bangunan", "Luas Tanah", "Luas Bangunan"), lalu pilih
+    # baris mana yang mau diisi ke Step 1 di bawah - tidak perlu ketik ulang.
+    # -----------------------------------------------------------------
+    with st.expander(t("📥 Import dari Excel (opsional)", "📥 Import from Excel (optional)"), expanded=False):
+        st.caption(t(
+            "Unggah file .xlsx atau .csv berisi daftar properti. Nama kolom bebas, "
+            "asal masing-masing memuat salah satu dari: Alamat, Lokasi (format "
+            "\"lat, lon\"), Dokumen (status sertifikat), Data Bangunan (teks bebas - "
+            "\"Tahun bangun: YYYY\" di dalamnya otomatis terbaca), Luas Tanah, Luas Bangunan.",
+            "Upload an .xlsx or .csv file listing properties. Column names are flexible, "
+            "as long as each contains one of: Alamat/Address, Lokasi/Location (\"lat, lon\" "
+            "format), Dokumen/Document (certificate status), Data Bangunan/Building Data "
+            "(free text - \"Tahun bangun: YYYY\"/\"Year built: YYYY\" inside is auto-read), "
+            "Luas Tanah/Land Area, Luas Bangunan/Building Area."
+        ))
+        excel_file = st.file_uploader(
+            t("File Excel/CSV", "Excel/CSV File"), type=["xlsx", "csv"], key="step1_excel_upload",
+        )
+        if excel_file is not None:
+            ok_xl, rows_or_err = parse_property_excel(excel_file.getvalue(), excel_file.name)
+            if not ok_xl:
+                st.error(rows_or_err)
+            else:
+                xl_rows = rows_or_err
+                st.success(t(f"✅ {len(xl_rows)} baris properti terbaca dari {excel_file.name}.",
+                             f"✅ {len(xl_rows)} property row(s) read from {excel_file.name}."))
+                xl_labels = [f"{r['no']}. {r['alamat'][:70]}" for r in xl_rows]
+                xl_pick = st.selectbox(
+                    t("Pilih baris properti", "Pick a property row"), options=list(range(len(xl_rows))),
+                    format_func=lambda i: xl_labels[i], key="step1_excel_row_pick",
+                )
+                xl_row = xl_rows[xl_pick]
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric(t("Luas Tanah", "Land Area"), f"{xl_row['luas_tanah']} m²" if xl_row['luas_tanah'] is not None else "N/A")
+                pc2.metric(t("Luas Bangunan", "Building Area"), f"{xl_row['luas_bangunan']} m²" if xl_row['luas_bangunan'] is not None else "N/A")
+                pc3.metric(t("Tahun Bangun", "Year Built"), xl_row['tahun_bangun'] or "N/A")
+                st.caption(f"📍 {xl_row['alamat']}")
+                if xl_row["lat"] is not None and xl_row["lon"] is not None:
+                    st.caption(t(f"Koordinat terbaca: {xl_row['lat']:.6f}, {xl_row['lon']:.6f}",
+                                 f"Coordinates read: {xl_row['lat']:.6f}, {xl_row['lon']:.6f}"))
+                else:
+                    st.caption(t("⚠️ Koordinat tidak terbaca dari kolom Lokasi - isi manual di bawah.",
+                                 "⚠️ Coordinates not found in the Lokasi column - fill in manually below."))
+                st.caption(t(
+                    f"Status Sertifikat terbaca sebagai: **{xl_row['status_sertifikat']}** "
+                    f"(dari teks: \"{xl_row['dokumen_text'] or '-'}\")",
+                    f"Certificate Status read as: **{xl_row['status_sertifikat']}** "
+                    f"(from text: \"{xl_row['dokumen_text'] or '-'}\")"
+                ))
+                if st.button(t("📥 Isi ke Form", "📥 Fill Form"), type="primary", key="btn_apply_excel_row"):
+                    for _k, _key in (("kecamatan", "step1_kecamatan"), ("kabkota", "step1_kabkota"),
+                                     ("provinsi", "step1_provinsi")):
+                        if xl_row.get(_k):
+                            st.session_state[_key] = xl_row[_k]
+                    st.session_state.step1_alamat = xl_row["alamat"]
+                    if xl_row.get("luas_tanah") is not None:
+                        st.session_state.step1_luas_tanah = float(xl_row["luas_tanah"])
+                    if xl_row.get("luas_bangunan") is not None:
+                        st.session_state.step1_luas_bangunan = float(xl_row["luas_bangunan"])
+                    if xl_row.get("tahun_bangun"):
+                        st.session_state.step1_tahun_bangun = int(xl_row["tahun_bangun"])
+                    st.session_state.step1_status_sertifikat = xl_row["status_sertifikat"]
+                    if xl_row["lat"] is not None and xl_row["lon"] is not None:
+                        st.session_state.pin_lat, st.session_state.pin_lon = xl_row["lat"], xl_row["lon"]
+                        st.session_state.map_center = [xl_row["lat"], xl_row["lon"]]
+                        st.session_state.map_zoom = 17
+                        st.session_state.autofill_coords = (round(xl_row["lat"], 6), round(xl_row["lon"], 6))
+                        st.session_state.autofill_address_label = xl_row["alamat"]
+                    st.rerun()
+
     st.subheader(t("Lokasi Properti", "Property Location"))
     # Search Address ditaruh PALING PERTAMA (jadi mode default) - appraiser
     # coba cari alamat lewat nama tempat dulu (cara paling cepat kalau
@@ -259,8 +333,6 @@ if st.session_state.step == 1:
         with sc1:
             search_query = st.text_input(
                 t("Cari alamat", "Search address"), value=alamat or "", key="search_query_step1",
-                placeholder=t("mis. Perumahan Palem Azna Residence, Ciracas, Jakarta Timur",
-                               "e.g. Perumahan Palem Azna Residence, Ciracas, East Jakarta"),
             )
         with sc2:
             st.write("")
@@ -375,19 +447,6 @@ if st.session_state.step == 1:
                 "or \"Manual Latitude & Longitude\" mode instead."
             ))
         else:
-            st.caption(t(
-                "Seperti pinpoint lokasi di Gojek/Grab/Shopee: cari area (opsional) untuk "
-                "memindahkan peta, lalu klik titik yang tepat di peta untuk menandai lokasi "
-                "properti. Setelah itu, pakai tombol \"📝 Isi Otomatis Alamat\" di bawah form "
-                "ini untuk mengisi Alamat, Kecamatan, Kabupaten/Kota, dan Provinsi otomatis "
-                "dari titik itu (tetap bisa diedit manual kalau kurang presisi).",
-                "Just like pinpointing a location in Gojek/Grab/Shopee: search for an area "
-                "(optional) to move the map, then click the exact point on the map to mark "
-                "the property location. Afterward, use the \"📝 Auto-fill Address\" button "
-                "below this form to fill in the Address, Sub-district, City/Regency, and "
-                "Province automatically from that point (still editable manually if not "
-                "precise enough)."
-            ))
             rc1, rc2 = st.columns([3, 1])
             with rc1:
                 recenter_query = st.text_input(
@@ -444,17 +503,36 @@ if st.session_state.step == 1:
                 st.session_state.pin_lat or -6.2088, st.session_state.pin_lon or 106.8456,
             ]
             default_zoom = st.session_state.get("map_zoom", 16)
-            fmap = folium.Map(location=default_center, zoom_start=default_zoom)
+            # Tampilan disamakan dengan peta Step 4: layer OpenStreetMap + Satelit,
+            # lingkaran radius 200 m & 500 m, marker rumah merah, dan kontrol layer.
+            fmap = folium.Map(location=default_center, zoom_start=default_zoom, tiles=None)
+            folium.TileLayer("OpenStreetMap", name="OpenStreetMap", show=True).add_to(fmap)
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri World Imagery", name=t("Satelit", "Satellite"), show=False,
+            ).add_to(fmap)
             if st.session_state.pin_lat and st.session_state.pin_lon:
+                for _r in (200, 500):
+                    folium.Circle(
+                        [st.session_state.pin_lat, st.session_state.pin_lon], radius=_r,
+                        color="#1e88e5", weight=1, fill=False, tooltip=f"{_r} m",
+                    ).add_to(fmap)
                 folium.Marker(
                     [st.session_state.pin_lat, st.session_state.pin_lon],
                     tooltip=t("Lokasi Terpilih", "Selected Location") + f" ({st.session_state.pin_lat:.6f}, {st.session_state.pin_lon:.6f})",
                     icon=folium.Icon(color="red", icon="home", prefix="fa"),
                 ).add_to(fmap)
+            folium.LayerControl(collapsed=False).add_to(fmap)
             map_data = st_folium(
                 fmap, height=420, use_container_width=True, key="pinpoint_map",
                 returned_objects=["last_clicked"],
             )
+            st.caption(t(
+                "Lingkaran biru = radius 200 m & 500 m dari titik yang dipilih (muncul setelah Anda "
+                "mengklik titik di peta). Pakai layer Satelit di pojok kanan atas peta untuk melihat kondisi sekitar.",
+                "Blue circles = 200 m & 500 m radius around the selected point (they appear after you "
+                "click a point on the map). Use the Satellite layer at the top right of the map to see the surroundings."
+            ))
 
             if map_data and map_data.get("last_clicked"):
                 clicked_lat = map_data["last_clicked"]["lat"]
@@ -577,6 +655,14 @@ if st.session_state.step == 1:
                 # (step1_alamat/kecamatan/kabkota/provinsi) SEBELUM widget itu
                 # dirender - Streamlit mengizinkan ini karena baris ini dieksekusi
                 # lebih dulu daripada widget-widget tsb pada run yang sama.
+                # Alamat LENGKAP: gabungkan jalan/nama tempat + kecamatan + kab/kota
+                # + provinsi + kode pos (bagian yang sudah tercantum di teks
+                # alamat tidak diulang).
+                _full_parts = [alamat_final]
+                for _p in (rev.get("kecamatan"), rev.get("kabkota"), rev.get("provinsi"), rev.get("postcode")):
+                    if _p and _p.strip().lower() not in ", ".join(_full_parts).lower():
+                        _full_parts.append(_p.strip())
+                alamat_final = ", ".join(p for p in _full_parts if p)
                 st.session_state.step1_alamat = alamat_final
                 if rev["kecamatan"]:
                     st.session_state.step1_kecamatan = rev["kecamatan"]
@@ -629,13 +715,14 @@ if st.session_state.step == 1:
     st.subheader(t("Property Details", "Property Details"))
     c1, c2, c3 = st.columns(3)
     with c1:
-        luas_tanah = st.number_input(t("Luas Tanah / LT (m²)", "Land Area / LT (m²)"), min_value=0.0, step=1.0)
+        luas_tanah = st.number_input(t("Luas Tanah / LT (m²)", "Land Area / LT (m²)"), min_value=0.0, step=1.0, key="step1_luas_tanah")
     with c2:
-        luas_bangunan = st.number_input(t("Luas Bangunan / LB (m²)", "Building Area / LB (m²)"), min_value=0.0, step=1.0)
+        luas_bangunan = st.number_input(t("Luas Bangunan / LB (m²)", "Building Area / LB (m²)"), min_value=0.0, step=1.0, key="step1_luas_bangunan")
     with c3:
         tahun_bangun = st.number_input(
             t("Tahun Bangun (opsional)", "Year Built (optional)"), min_value=1900, max_value=2100,
             value=None, step=1, placeholder=t("Kosongkan jika tidak diketahui", "Leave blank if unknown"),
+            key="step1_tahun_bangun",
             help=t(
                 "Opsional - kosongkan kalau tahun bangun tidak diketahui atau tidak relevan "
                 "(mis. tanah kosong). Kalau dikosongkan, umur bangunan di Step 3 perlu diisi "
@@ -650,7 +737,7 @@ if st.session_state.step == 1:
     _status_sertifikat_display = {"Lainnya": t("Lainnya", "Other")}
     status_sertifikat = st.selectbox(
         t("Status Sertifikat", "Certificate Status"), _status_sertifikat_options,
-        index=_status_sertifikat_options.index("Lainnya"),
+        index=_status_sertifikat_options.index("Lainnya"), key="step1_status_sertifikat",
         format_func=lambda o: _status_sertifikat_display.get(o, o),
     )
 
@@ -752,10 +839,34 @@ elif st.session_state.step == 2:
     with c1:
         st.metric(t("Kode Zona", "Zone Code"), str(result.get("kode_zona", "-")))
         zona_nilai_tanah = st.text_input(t("Zona Nilai Tanah", "Land Value Zone"), value=str(result.get("zona_nilai_tanah", "-")))
+        _z_min, _z_max, _z_exact = result.get("nilai_min"), result.get("nilai_max"), result.get("nilai_exact")
+        _default_znt = float(result.get("harga_znt_per_m2", 0) or 0)
+        if _z_exact:
+            st.success(t(
+                f"✅ Angka ZNT presisi dari data Bhumi: {fmt_rp(_z_exact)}/m² "
+                f"(rentang popup: {fmt_rp(_z_min)} – {fmt_rp(_z_max)})",
+                f"✅ Precise ZNT value from Bhumi data: {fmt_rp(_z_exact)}/m² "
+                f"(popup range: {fmt_rp(_z_min)} – {fmt_rp(_z_max)})"
+            ))
+        elif _z_min and _z_max and _z_max > _z_min:
+            _pos_opts = {
+                t("Minimum", "Minimum"): float(_z_min),
+                t("Titik tengah", "Midpoint"): round((float(_z_min) + float(_z_max)) / 2, 0),
+                t("Maksimum", "Maximum"): float(_z_max),
+            }
+            _pos_labels = list(_pos_opts.keys())
+            _pos = st.radio(
+                t("Posisi dalam rentang Bhumi", "Position within Bhumi range"),
+                _pos_labels, index=1, horizontal=True, key="znt_range_pos",
+            )
+            _default_znt = _pos_opts[_pos]
         harga_znt = st.number_input(
             t("Harga ZNT / m² (Rp)", "ZNT Price / m² (Rp)"), min_value=0.0, step=1000.0,
-            value=float(result.get("harga_znt_per_m2", 0) or 0),
+            value=_default_znt,
         )
+        if result.get("raw_popup_text"):
+            with st.expander(t("🔎 Teks mentah popup Bhumi (untuk pengecekan)", "🔎 Raw Bhumi popup text (for checking)")):
+                st.code(result["raw_popup_text"])
     with c2:
         st.metric(t("Tanggal Data", "Data Date"), str(result.get("tanggal_data", "-")))
         st.metric("Confidence Level", str(result.get("confidence_level", "-")))
@@ -781,6 +892,10 @@ elif st.session_state.step == 2:
                 "source_notes": result.get("source_notes", ""),
                 "lat": result.get("lat"),
                 "lon": result.get("lon"),
+                "nilai_min": result.get("nilai_min"),
+                "nilai_max": result.get("nilai_max"),
+                "nilai_exact": result.get("nilai_exact"),
+                "raw_popup_text": result.get("raw_popup_text", ""),
             }
             goto(3)
 
@@ -906,14 +1021,16 @@ elif st.session_state.step == 3:
     with c1:
         brb_per_m2 = st.number_input(
             t("Biaya Reproduksi Baru / m² (Rp)", "New Reproduction Cost / m² (Rp)"), min_value=0.0, step=50_000.0,
-            value=float(st.session_state.bangunan_result.get("brb_per_m2", 5_000_000.0)),
+            value=float(st.session_state.bangunan_result.get("brb_per_m2", calc.BRB_DEFAULT_PER_M2)),
             help=t(
-                f"Default Rp 5.000.000/m². Tabel klasifikasi di atas ({fmt_rp(default_brb_per_m2)} "
-                f"untuk '{klasifikasi}') hanya acuan - sesuaikan manual dengan survei pasar/kontraktor/"
-                "data BTB terbaru bila berbeda.",
-                f"Default Rp 5,000,000/m². The classification table above ({fmt_rp(default_brb_per_m2)} "
-                f"for '{klasifikasi}') is a reference only - adjust manually with a market/contractor "
-                "survey or the latest BTB data if different."
+                f"Default {fmt_rp(calc.BRB_DEFAULT_PER_M2)}/m² (BTB MAPPI 2025 x IKK BPS 2025, Kota "
+                f"Surabaya - kota anchor IKK 2025, R. Tinggal Menengah). Tabel klasifikasi di atas "
+                f"({fmt_rp(default_brb_per_m2)} untuk '{klasifikasi}') hanya acuan - sesuaikan manual "
+                "dengan survei pasar/kontraktor/data BTB terbaru bila berbeda.",
+                f"Default {fmt_rp(calc.BRB_DEFAULT_PER_M2)}/m² (BTB MAPPI 2025 x BPS IKK 2025, Surabaya - "
+                f"IKK 2025 anchor city, R. Tinggal Menengah/Medium Residential). The classification table "
+                f"above ({fmt_rp(default_brb_per_m2)} for '{klasifikasi}') is a reference only - adjust "
+                "manually with a market/contractor survey or the latest BTB data if different."
             ),
         )
         umur_bangunan = st.number_input(
@@ -925,6 +1042,10 @@ elif st.session_state.step == 3:
             value=float(st.session_state.bangunan_result.get(
                 "umur_ekonomis", klasifikasi_default["umur_ekonomis_tahun"]
             )),
+        )
+        jumlah_lantai = st.number_input(
+            t("Jumlah Lantai", "Number of Floors"), min_value=1, step=1,
+            value=int(st.session_state.bangunan_result.get("jumlah_lantai", 1)),
         )
     st.caption(t("ℹ️ Catatan: Penyusutan (depresiasi) bangunan dibatasi maksimal 80%.",
                  "ℹ️ Note: Building depreciation is capped at a maximum of 80%."))
@@ -942,10 +1063,11 @@ elif st.session_state.step == 3:
         penyusutan = calc.hitung_penyusutan(brb, umur_bangunan, umur_ekonomis)
         nilai_bangunan = calc.hitung_nilai_bangunan(brb, penyusutan)
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric(t("Luas Bangunan", "Building Area"), f"{d['luas_bangunan']:.0f} m²")
         c2.metric(t("Biaya Reproduksi Baru (BRB)", "New Reproduction Cost (BRB)"), fmt_rp(brb))
         c3.metric(t("Penyusutan", "Depreciation"), fmt_rp(penyusutan))
+        c4.metric(t("Jumlah Lantai", "Number of Floors"), str(jumlah_lantai))
         st.metric(t("Nilai Bangunan", "Building Value"), fmt_rp(nilai_bangunan))
         st.caption(t("Formula: Nilai Bangunan = BRB − Penyusutan (Penyusutan = BRB × (Umur Bangunan / Umur Ekonomis), dibatasi maks 80%)",
                      "Formula: Building Value = BRB − Depreciation (Depreciation = BRB × (Building Age / Economic Life), capped at 80%)"))
@@ -1019,10 +1141,11 @@ elif st.session_state.step == 3:
         penyusutan = round(asset_value - schedule[-1]["balance"], 2) if schedule else 0.0
         nilai_bangunan = schedule[-1]["balance"] if schedule else asset_value
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric(t("Luas Bangunan", "Building Area"), f"{d['luas_bangunan']:.0f} m²")
         c2.metric("Asset Value (Awal)" if st.session_state.lang == "id" else "Asset Value (Initial)", fmt_rp(asset_value))
         c3.metric(t("Total Penyusutan", "Total Depreciation"), fmt_rp(penyusutan))
+        c4.metric(t("Jumlah Lantai", "Number of Floors"), str(jumlah_lantai))
         _unit_disp2 = t("Tahun", "Years") if unit_periode == "Tahun" else t("Bulan", "Months")
         st.metric(t(f"Nilai Bangunan (Balance setelah {periode_tahun} {unit_periode.lower()})",
                     f"Building Value (Balance after {periode_tahun} {_unit_disp2.lower()})"), fmt_rp(nilai_bangunan))
@@ -1067,6 +1190,7 @@ elif st.session_state.step == 3:
                     "brb": brb,
                     "umur_bangunan": umur_bangunan,
                     "umur_ekonomis": umur_ekonomis,
+                    "jumlah_lantai": jumlah_lantai,
                     "penyusutan": penyusutan,
                     "nilai_bangunan": nilai_bangunan,
                     "depresiasi_detail": depresiasi_detail,
@@ -1080,18 +1204,69 @@ elif st.session_state.step == 4:
     st.header(t("Step 4 — Analisis Faktor Pengurang", "Step 4 — Reduction Factor Analysis"))
     d = st.session_state.data
 
+    # Status API key yang sudah diisi (supaya appraiser tahu sebelum analisis jalan)
+    _keys_status = [
+        ("Serper", bool((st.session_state.get("serper_key") or "").strip()),
+         t("pencarian web", "web search")),
+        ("Groq", bool((st.session_state.get("groq_key") or "").strip()),
+         t("analisis AI", "AI analysis")),
+        ("Gemini", bool((st.session_state.get("gemini_key") or "").strip()),
+         t("AI cadangan & foto", "backup AI & photos")),
+    ]
+    with st.container(border=True):
+        st.markdown(f"**{t('🔑 API Key yang sudah ditambahkan', '🔑 API Keys added')}**")
+        _kc = st.columns(3)
+        for _col, (_nm, _ok, _use) in zip(_kc, _keys_status):
+            with _col:
+                st.markdown(f"{'✅' if _ok else '⚠️'} **{_nm}**")
+                st.caption(f"{_use} — " + (t("terisi", "added") if _ok else t("belum diisi", "not added")))
+        if not all(_ok for _, _ok, _ in _keys_status):
+            _missing = ", ".join(_nm for _nm, _ok, _ in _keys_status if not _ok)
+            st.caption(t(f"Isi key yang belum ada ({_missing}) di sidebar \"⚙️ API Keys\" agar analisis AI berjalan penuh.",
+                         f"Add the missing key(s) ({_missing}) in the sidebar \"⚙️ API Keys\" for full AI analysis."))
+
     if not st.session_state.auto_flags or st.session_state.get("auto_flags_lang") != st.session_state.lang:
-        with st.status(t("Menganalisis lokasi...", "Analyzing location..."), expanded=True) as status:
-            log, flags, notes = run_pinpoint_agent(
-                d["alamat"], d.get("lat") or 0, d.get("lon") or 0, serper, groq, gemini,
-                lang=st.session_state.lang,
-            )
-            for line in log:
-                st.write(line)
-            status.update(label=t("Selesai", "Done"), state="complete")
-        st.session_state.auto_flags = flags
-        st.session_state.auto_notes = notes
-        st.session_state.auto_flags_lang = st.session_state.lang
+        _lat4, _lon4 = d.get("lat"), d.get("lon")
+        _gis_done = False
+        if _lat4 and _lon4:
+            with st.status(t("Mengambil data GIS (OpenStreetMap + BNPB InaRISK)...",
+                             "Fetching GIS data (OpenStreetMap + BNPB InaRISK)..."), expanded=True) as status:
+                _gkey = (round(float(_lat4), 6), round(float(_lon4), 6))
+                _raw = st.session_state.get("gis_raw")
+                if not _raw or st.session_state.get("gis_raw_key") != _gkey:
+                    _ok_g, _raw = gis_data.fetch_gis_raw(float(_lat4), float(_lon4))
+                    if _ok_g:
+                        st.session_state.gis_raw = _raw
+                        st.session_state.gis_raw_key = _gkey
+                    else:
+                        st.write(t(f"⚠ Data GIS gagal diambil ({_raw}) - memakai analisis web+AI sebagai cadangan.",
+                                   f"⚠ GIS data could not be fetched ({_raw}) - falling back to web+AI analysis."))
+                        st.session_state.gis_error = str(_raw)
+                        _raw = None
+                if _raw:
+                    _flags, _notes, _gis = gis_data.analyze_gis(_raw, st.session_state.lang)
+                    st.session_state.auto_flags = _flags
+                    st.session_state.auto_notes = _notes
+                    st.session_state.gis_data = _gis
+                    st.session_state.auto_flags_lang = st.session_state.lang
+                    st.write(t("✓ Data GIS berhasil dianalisis", "✓ GIS data analyzed"))
+                    status.update(label=t("Selesai", "Done"), state="complete")
+                    _gis_done = True
+        if not _gis_done:
+            if not (_lat4 and _lon4):
+                st.session_state.gis_error = "no coordinates"
+            st.session_state.gis_data = None
+            with st.status(t("Menganalisis lokasi...", "Analyzing location..."), expanded=True) as status:
+                log, flags, notes = run_pinpoint_agent(
+                    d["alamat"], d.get("lat") or 0, d.get("lon") or 0, serper, groq, gemini,
+                    lang=st.session_state.lang,
+                )
+                for line in log:
+                    st.write(line)
+                status.update(label=t("Selesai", "Done"), state="complete")
+            st.session_state.auto_flags = flags
+            st.session_state.auto_notes = notes
+            st.session_state.auto_flags_lang = st.session_state.lang
 
     if not st.session_state.checklist_auto_scores or st.session_state.get("checklist_auto_lang") != st.session_state.lang:
         with st.status(t("Memperkirakan sebagian item checklist...", "Estimating some checklist items..."), expanded=True) as status:
@@ -1103,6 +1278,20 @@ elif st.session_state.step == 4:
             for line in log2:
                 st.write(line)
             status.update(label=t("Selesai", "Done"), state="complete")
+        # Akses jalan: pakai data jalan terdekat dari GIS kalau ada (lebih akurat dari flag jalan utama saja)
+        _rd = (st.session_state.get("gis_data") or {}).get("road")
+        if _rd:
+            if _rd["narrow"] is True:
+                cl_scores["akses_jalan"] = 3
+            elif _rd["narrow"] is None:      # jalan lingkungan, lebar tak tercatat -> perlu cek
+                cl_scores["akses_jalan"] = max(cl_scores.get("akses_jalan", 0), 1)
+            else:
+                cl_scores["akses_jalan"] = 0
+            cl_notes["akses_jalan"] = (
+                f"GIS: {_rd['name'] or t('(tanpa nama)', '(unnamed)')} — {_rd['highway']}, "
+                f"{_rd['dist_m']} m — {_rd['verdict']}"
+            )
+            cl_auto_keys = set(cl_auto_keys) | {"akses_jalan"}
         st.session_state.checklist_auto_scores = cl_scores
         st.session_state.checklist_auto_notes = cl_notes
         st.session_state.checklist_auto_keys = cl_auto_keys
@@ -1113,6 +1302,165 @@ elif st.session_state.step == 4:
         "kualitas_konstruksi", "perawatan_bangunan", "legalitas",
         "kondisi_lingkungan", "peruntukan_lahan", "akses_jalan",
     ]
+
+    gis = st.session_state.get("gis_data")
+    st.subheader(t("🗺️ Peta & Data GIS Lokasi", "🗺️ Location Map & GIS Data"))
+    if gis:
+        _glat, _glon = gis["lat"], gis["lon"]
+        _en = st.session_state.lang == "en"
+        _cat_style = {
+            "minimarket": ("orange", "shopping-cart"), "supermarket": ("orange", "shopping-cart"),
+            "hospital": ("red", "plus-square"), "clinic": ("lightred", "plus"),
+            "school": ("blue", "graduation-cap"), "market": ("green", "shopping-basket"),
+            "worship": ("purple", "star"), "cemetery": ("gray", "cross"),
+            "rail_station": ("black", "train"), "substation": ("darkred", "bolt"),
+            "landfill": ("darkgreen", "trash"), "park": ("lightgreen", "tree"),
+            "bus_station": ("cadetblue", "bus"), "industrial": ("darkpurple", "industry"),
+        }
+        try:
+            import folium
+            from streamlit_folium import st_folium
+            _fm = folium.Map(location=[_glat, _glon], zoom_start=17, tiles=None)
+            folium.TileLayer("OpenStreetMap", name="OpenStreetMap", show=True).add_to(_fm)
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri World Imagery", name=t("Satelit", "Satellite"), show=False,
+            ).add_to(_fm)
+            for _r in (200, 500):
+                folium.Circle([_glat, _glon], radius=_r, color="#1e88e5", weight=1, fill=False,
+                              tooltip=f"{_r} m").add_to(_fm)
+            _lines = folium.FeatureGroup(name=t("Jalan / Rel / SUTET / Sungai", "Roads / Rail / Power lines / Waterways"))
+            _line_color = {"railway": "#000000", "power_line": "#d32f2f", "waterway": "#0288d1"}
+            for _f in gis["features"]:
+                if _f.get("line") and _f["cat"] in ("railway", "power_line", "waterway", "road"):
+                    if _f["cat"] == "road":
+                        _col = "#ef6c00" if _f["highway"] in gis_data.NARROW_ROAD_TYPES or (_f["width"] and _f["width"] < 3) else "#757575"
+                    else:
+                        _col = _line_color[_f["cat"]]
+                    _lab = gis_data.CAT_LABELS[_f["cat"]][1 if _en else 0]
+                    _tip = f"{_lab}: {_f['name'] or _f.get('highway') or ''} — {_f['dist_m']} m"
+                    if _f["cat"] == "road" and _f["width"]:
+                        _tip += f" (w={_f['width']:g} m)"
+                    folium.PolyLine(_f["line"], color=_col, weight=3, opacity=0.8, tooltip=_tip).add_to(_lines)
+            _lines.add_to(_fm)
+            _pois = folium.FeatureGroup(name=t("Fasilitas terdekat", "Nearest facilities"))
+            _shown = {}
+            for _f in sorted(gis["features"], key=lambda x: x["dist_m"]):
+                if _f["cat"] in _cat_style and _shown.get(_f["cat"], 0) < 3:
+                    _shown[_f["cat"]] = _shown.get(_f["cat"], 0) + 1
+                    _lab = gis_data.CAT_LABELS[_f["cat"]][1 if _en else 0]
+                    _color, _icon = _cat_style[_f["cat"]]
+                    folium.Marker(
+                        [_f["lat"], _f["lon"]], tooltip=f"{_lab}: {_f['name'] or '-'} — {_f['dist_m']} m",
+                        icon=folium.Icon(color=_color, icon=_icon, prefix="fa"),
+                    ).add_to(_pois)
+                    if _shown[_f["cat"]] == 1 and _f["cat"] in ("minimarket", "hospital", "school", "market"):
+                        folium.PolyLine([[_glat, _glon], [_f["lat"], _f["lon"]]], color="#1e88e5",
+                                        weight=2, dash_array="6", tooltip=f"{_f['dist_m']} m").add_to(_pois)
+            _pois.add_to(_fm)
+            folium.Marker([_glat, _glon], tooltip=t("Lokasi Properti", "Property Location"),
+                          icon=folium.Icon(color="red", icon="home", prefix="fa")).add_to(_fm)
+            folium.LayerControl(collapsed=False).add_to(_fm)
+            st_folium(_fm, height=460, use_container_width=True, key="gis_map", returned_objects=[])
+            st.caption(t(
+                "Lingkaran biru = radius 200 m & 500 m. Garis putus-putus = jarak ke minimarket/RS/sekolah/pasar "
+                "terdekat. Jalan oranye = kelas jalan kecil/lebar < 3 m. Pakai layer Satelit untuk melihat lebar jalan.",
+                "Blue circles = 200 m & 500 m radius. Dashed lines = distance to the nearest minimart/hospital/"
+                "school/market. Orange roads = small road class/width < 3 m. Use the Satellite layer to eyeball road width."
+            ))
+        except ImportError:
+            st.warning(t("Peta butuh paket folium & streamlit-folium (lihat requirements.txt).",
+                         "The map needs the folium & streamlit-folium packages (see requirements.txt)."))
+
+        if gis.get("warnings"):
+            st.caption(t("⚠ Sebagian data OpenStreetMap gagal diambil (server sibuk) - hasil bisa kurang lengkap: ",
+                         "⚠ Some OpenStreetMap data couldn't be fetched (server busy) - results may be incomplete: ")
+                       + "; ".join(gis["warnings"]))
+        gc1, gc2 = st.columns([3, 2])
+        with gc1:
+            st.markdown(t("**📏 Jarak ke fasilitas/objek terdekat (dari OpenStreetMap)**",
+                          "**📏 Distance to nearest facilities/objects (from OpenStreetMap)**"))
+            _rows = [
+                {t("Objek", "Object"): gis_data.CAT_LABELS[c][1 if _en else 0],
+                 t("Nama", "Name"): f["name"] or "-", t("Jarak (m)", "Distance (m)"): f["dist_m"]}
+                for c, f in sorted(gis["nearest"].items(), key=lambda kv: kv[1]["dist_m"]) if c != "road"
+            ]
+            if _rows:
+                st.dataframe(_rows, use_container_width=True, hide_index=True)
+            else:
+                st.caption(t("Tidak ada objek tercatat di OSM dalam radius pencarian.",
+                             "No objects recorded in OSM within the search radius."))
+        with gc2:
+            _road = gis.get("road")
+            st.markdown(t("**🛣️ Akses jalan terdekat**", "**🛣️ Nearest road access**"))
+            if _road:
+                st.write(f"{_road['name'] or t('(tanpa nama)', '(unnamed)')} — {_road['highway']}, {_road['dist_m']} m")
+                (st.warning if _road["narrow"] else st.info)(_road["verdict"])
+                st.caption(t("OSM jarang mencatat lebar jalan; cek citra satelit/lapangan.",
+                             "OSM rarely records road width; check satellite imagery/on site."))
+            else:
+                st.caption(t("Tidak ada jalan tercatat di OSM dekat titik ini.", "No road recorded in OSM near this point."))
+
+            st.markdown(t("**🌊 Bahaya resmi (BNPB InaRISK)**", "**🌊 Official hazard (BNPB InaRISK)**"))
+            _hz = gis.get("hazard") or {}
+            _any_ok = False
+            for _k, _h in _hz.items():
+                _lbl = _h["label_en"] if _en else _h["label_id"]
+                if _h.get("ok"):
+                    _any_ok = True
+                    _emoji = {"Rendah": "🟢", "Sedang": "🟡", "Tinggi": "🔴"}.get(_h["kelas"], "")
+                    st.write(f"{_emoji} {_lbl}: **{_h['kelas']}** ({_h['value']:g})")
+                else:
+                    st.write(f"⚪ {_lbl}: {t('tidak tersedia', 'unavailable')} ({_h.get('error') or '-'})")
+            if not _any_ok:
+                st.caption(t(f"Layanan InaRISK tidak bisa diakses dari server ini. Cek manual di {gis_data.INARISK_PORTAL}",
+                             f"The InaRISK service could not be reached from this server. Check manually at {gis_data.INARISK_PORTAL}"))
+            else:
+                st.caption(t(f"Klasifikasi dari nilai raster InaRISK - verifikasi di {gis_data.INARISK_PORTAL}",
+                             f"Classified from InaRISK raster value - verify at {gis_data.INARISK_PORTAL}"))
+
+        st.markdown(t("**📷 Google Street View**", "**📷 Google Street View**"))
+        _sv_url = gis_data.streetview_embed_url(_glat, _glon)
+        try:
+            st.iframe(_sv_url, height=380)  # Streamlit versi baru
+        except Exception:
+            import streamlit.components.v1 as _components
+            _components.iframe(_sv_url, height=380)
+        lb1, lb2, lb3 = st.columns(3)
+        lb1.link_button(t("Buka Street View di Google Maps", "Open Street View in Google Maps"),
+                        gis_data.streetview_link(_glat, _glon), use_container_width=True)
+        lb2.link_button(t("Buka lokasi di Google Maps", "Open location in Google Maps"),
+                        gis_data.google_maps_link(_glat, _glon), use_container_width=True)
+        lb3.link_button(t("Foto jalan di Mapillary (gratis)", "Street photos on Mapillary (free)"),
+                        f"https://www.mapillary.com/app/?lat={_glat}&lng={_glon}&z=17", use_container_width=True)
+        st.caption(t("Street View di atas tanpa API key. Kalau kotaknya kosong (tidak ada cakupan), pakai tombol link.",
+                     "Street View above needs no API key. If the box is blank (no coverage), use the link buttons."))
+    else:
+        _gerr = st.session_state.get("gis_error") or ""
+        if _gerr == "no coordinates":
+            st.warning(t("Koordinat properti belum ada - kembali ke Step 1 dan pilih titik lokasi.",
+                         "No property coordinates yet - go back to Step 1 and pick a location point."))
+        else:
+            st.warning(t(
+                "Data GIS (OpenStreetMap) gagal diambil - server peta gratis kadang sibuk atau memblokir "
+                "koneksi. Klik tombol di bawah untuk mencoba lagi.",
+                "GIS data (OpenStreetMap) couldn't be fetched - the free map servers are sometimes busy or "
+                "block connections. Click the button below to retry."))
+            if _gerr:
+                st.caption(f"{t('Detail error', 'Error details')}: {_gerr}")
+        if st.button(t("🔄 Coba ambil data GIS lagi", "🔄 Retry fetching GIS data"), key="btn_retry_gis"):
+            st.session_state.auto_flags = {}
+            st.session_state.auto_notes = {}
+            st.session_state.gis_raw = None
+            st.session_state.gis_data = None
+            st.session_state.gis_error = ""
+            st.session_state.checklist_auto_scores = {}
+            st.session_state.checklist_auto_notes = {}
+            st.session_state.checklist_auto_keys = set()
+            for key in calc.RESTRIKSI_LABELS:
+                st.session_state.pop(f"restriksi_{key}", None)
+            st.session_state.restriksi_flags = {}
+            st.rerun()
 
     st.subheader(t("Analisis Otomatis", "Automatic Analysis"))
     flag_labels = {
@@ -1151,8 +1499,13 @@ elif st.session_state.step == 4:
     if st.button(t("🔄 Ulangi analisis lokasi otomatis", "🔄 Redo automatic location analysis")):
         st.session_state.auto_flags = {}
         st.session_state.auto_notes = {}
+        st.session_state.gis_raw = None
+        st.session_state.gis_data = None
         for key in flag_labels:
             st.session_state.pop(f"flag_{key}", None)
+        for key in calc.RESTRIKSI_LABELS:
+            st.session_state.pop(f"restriksi_{key}", None)
+        st.session_state.restriksi_flags = {}
         # Checklist manual sebagian diturunkan dari hasil analisis lokasi ini
         # (akses_jalan, kondisi_lingkungan) - reset juga supaya ikut ditarik ulang
         # dari flag lokasi yang baru, bukan flag lokasi lama yang sudah dibuang.
@@ -1250,11 +1603,20 @@ elif st.session_state.step == 4:
             "- highly flammable sites like oil/gas depots or nuclear reactors.",
     }
     restriksi_flags = {}
+    _gis_hints = (st.session_state.get("gis_data") or {}).get("hints") or {}
+    _saved_restriksi = st.session_state.get("restriksi_flags") or {}
     for key, label in calc.RESTRIKSI_LABELS.items():
+        # Auto-select dari GIS: kalau appraiser sudah pernah menekan Continue, pakai pilihannya;
+        # kalau belum, centang otomatis untuk kondisi yang terdeteksi GIS (bisa di-uncheck manual).
+        _hint = _gis_hints.get(key)
+        _default = bool(_saved_restriksi[key]) if key in _saved_restriksi else bool(_hint)
         restriksi_flags[key] = st.checkbox(
-            t(label, RESTRIKSI_LABELS_EN.get(key, label)), value=bool(st.session_state.get("restriksi_flags", {}).get(key, False)),
+            t(label, RESTRIKSI_LABELS_EN.get(key, label)), value=_default,
             key=f"restriksi_{key}",
         )
+        if _hint:
+            st.caption(f"🛰️ {_hint} " + t("(otomatis dicentang dari GIS — verifikasi lapangan, hapus centang jika keliru)",
+                                        "(auto-checked from GIS — verify on site, uncheck if wrong)"))
 
     if any(restriksi_flags.values()):
         aktif_labels = [t(calc.RESTRIKSI_LABELS[k], RESTRIKSI_LABELS_EN.get(k, calc.RESTRIKSI_LABELS[k])) for k, v in restriksi_flags.items() if v]
@@ -1382,7 +1744,7 @@ elif st.session_state.step == 6:
 
         # Estimasi Harga Bangunan & Harga Tanah pembanding: Harga Bangunan
         # diperkirakan dari Biaya Reproduksi Baru (BRB) per m² - default
-        # Rp 5.000.000/m² (tidak ikut BRB/m² Step 3) - dikali Luas Bangunan
+        # BRB_DEFAULT_PER_M2 (tidak ikut BRB/m² Step 3) - dikali Luas Bangunan
         # pembanding. Harga Tanah adalah sisa dari harga listing setelah
         # dikurangi estimasi Harga Bangunan tadi. Ini hanya estimasi kasar, bukan
         # hasil cost approach penuh - berguna sebagai pembanding kasar saja.
@@ -1463,9 +1825,10 @@ elif st.session_state.step == 6:
     znt_subjek_step6 = st.session_state.znt_result.get("harga_znt_per_m2", 0) or 0
     # BRB/m² (Biaya Reproduksi Baru) untuk mengestimasi Harga Bangunan tiap
     # pembanding (lihat enrich_comp di atas). Sengaja SELALU pakai default
-    # Rp 5.000.000/m² di sini, tidak ikut BRB/m² Step 3 - supaya estimasi Harga
-    # Bangunan pembanding tetap konsisten walau Step 3 diubah.
-    brb_subjek_step6 = 5_000_000.0
+    # BRB_DEFAULT_PER_M2 (lihat calculations.py - BTB MAPPI 2025 x IKK BPS 2025,
+    # Surabaya, R. Tinggal Menengah) di sini, tidak ikut BRB/m² Step 3 - supaya
+    # estimasi Harga Bangunan pembanding tetap konsisten walau Step 3 diubah.
+    brb_subjek_step6 = calc.BRB_DEFAULT_PER_M2
 
     # --- Ringkasan Data Properti Subjek (dari Step 1-3) - sebagai acuan cepat
     # sebelum membandingkan dengan properti pembanding di bawah. ---
@@ -1612,13 +1975,122 @@ elif st.session_state.step == 6:
             st.caption(t(f"Rentang LB diterima: **{_lb_lo:.0f} - {_lb_hi:.0f} m²** (subjek: {_lb:.0f} m²)",
                          f"Accepted LB range: **{_lb_lo:.0f} - {_lb_hi:.0f} m²** (subject: {_lb:.0f} m²)"))
 
+    # --- Peta lokasi subjek + pembanding + lingkaran radius ---
+    st.subheader(t("🗺️ Peta Lokasi Subjek & Pembanding", "🗺️ Subject & Comparables Map"))
+    if subjek_lat and subjek_lon:
+        try:
+            import math
+            import folium
+            from streamlit_folium import st_folium
+            _r_max = float(st.session_state.radius_km)
+            _cm = folium.Map(location=[subjek_lat, subjek_lon], zoom_start=13, tiles=None)
+            folium.TileLayer("OpenStreetMap", name="OpenStreetMap", show=True).add_to(_cm)
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri World Imagery", name=t("Satelit", "Satellite"), show=False,
+            ).add_to(_cm)
+            folium.Circle([subjek_lat, subjek_lon], radius=_r_max * 1000, color="#1e88e5", weight=2,
+                          fill=True, fill_opacity=0.04,
+                          tooltip=t(f"Radius maksimum {_r_max:g} km", f"Maximum radius {_r_max:g} km")).add_to(_cm)
+            folium.Marker([subjek_lat, subjek_lon], tooltip=t("Lokasi Properti (Subjek)", "Property Location (Subject)"),
+                          icon=folium.Icon(color="red", icon="home", prefix="fa")).add_to(_cm)
+
+            _pts = [(subjek_lat, subjek_lon)]
+            _n_nocoord = 0
+            _dlat = _r_max / 111.0
+            _dlon = _r_max / (111.0 * max(math.cos(math.radians(subjek_lat)), 0.1))
+            _pts += [(subjek_lat - _dlat, subjek_lon - _dlon), (subjek_lat + _dlat, subjek_lon + _dlon)]
+            # Pembanding dari listing sering hanya punya koordinat level kelurahan/kecamatan,
+            # sehingga beberapa pembanding punya titik yang PERSIS sama dan pin-nya
+            # saling menumpuk (yang terlihat hanya yang terakhir digambar). Kelompokkan
+            # berdasarkan koordinat lalu sebar sedikit (~40 m) agar semua pin kelihatan.
+            _groups = {}
+            for _i, _c in enumerate(st.session_state.comparables, start=1):
+                _clat, _clon = _c.get("lat"), _c.get("lon")
+                if not _clat or not _clon:
+                    _n_nocoord += 1
+                    continue
+                _groups.setdefault((round(float(_clat), 4), round(float(_clon), 4)), []).append(_i)
+            _n_spread = sum(len(v) for v in _groups.values() if len(v) > 1)
+            _pos = {}
+            for _idxs in _groups.values():
+                _m = len(_idxs)
+                for _j, _i in enumerate(_idxs):
+                    _c = st.session_state.comparables[_i - 1]
+                    _la, _lo = float(_c["lat"]), float(_c["lon"])
+                    if _m > 1:
+                        _ang = 2 * math.pi * _j / _m
+                        _off = 0.04  # km
+                        _la += (_off * math.cos(_ang)) / 111.0
+                        _lo += (_off * math.sin(_ang)) / (111.0 * max(math.cos(math.radians(_la)), 0.1))
+                    _pos[_i] = (_la, _lo)
+            for _i, _c in enumerate(st.session_state.comparables, start=1):
+                if _i not in _pos:
+                    continue
+                _clat, _clon = _pos[_i]
+                _k = calc.memenuhi_kriteria_pembanding(
+                    subjek, _c, radius_km=_r_max,
+                    luas_tanah_toleransi_pct=st.session_state.luas_tanah_toleransi_pct,
+                    luas_bangunan_toleransi_pct=st.session_state.luas_bangunan_toleransi_pct,
+                )
+                _color = "green" if _k["ok"] else ("orange" if _k["jarak_ok"] else "gray")
+                _hex = {"green": "#2e7d32", "orange": "#ef6c00", "gray": "#757575"}[_color]
+                _dist = _c.get("distance_km")
+                _popup = (
+                    f"<b>#{_i}</b> {_c.get('alamat') or '-'}<br>"
+                    f"{t('Harga', 'Price')}: {fmt_rp(_c.get('harga') or 0)}<br>"
+                    f"LT {(_c.get('luas_tanah') or 0):g} m² · LB {(_c.get('luas_bangunan') or 0):g} m²<br>"
+                    f"{t('Jarak', 'Distance')}: {_dist if _dist is not None else '-'} km"
+                )
+                folium.Marker(
+                    [_clat, _clon], tooltip=f"#{_i} — {_dist if _dist is not None else '-'} km",
+                    popup=folium.Popup(_popup, max_width=280),
+                    icon=folium.DivIcon(
+                        icon_size=(30, 30), icon_anchor=(15, 15),
+                        html=(f'<div style="width:30px;height:30px;border-radius:50%;background:{_hex};'
+                              'color:#fff;font-weight:700;font-size:14px;line-height:26px;text-align:center;'
+                              'border:2px solid #fff;box-shadow:0 0 4px rgba(0,0,0,.6);">'
+                              f'{_i}</div>'),
+                    ),
+                ).add_to(_cm)
+                folium.PolyLine([[subjek_lat, subjek_lon], [_clat, _clon]], color="#9e9e9e",
+                                weight=1, dash_array="4", opacity=0.6).add_to(_cm)
+                _pts.append((_clat, _clon))
+            _cm.fit_bounds([[min(p[0] for p in _pts), min(p[1] for p in _pts)],
+                            [max(p[0] for p in _pts), max(p[1] for p in _pts)]])
+            folium.LayerControl(collapsed=False).add_to(_cm)
+            st_folium(_cm, height=460, use_container_width=True, key="comp_map", returned_objects=[])
+            st.caption(t(
+                f"Pin merah = properti subjek. Lingkaran biru = radius maksimum {_r_max:g} km"
+                + " (diatur di kolom Radius di atas; default 5 km). Pin hijau = pembanding memenuhi kriteria, "
+                "oranye = jarak OK tapi luas di luar toleransi, abu-abu = di luar radius.",
+                f"Red pin = subject property. Blue circle = maximum radius {_r_max:g} km"
+                + " (set in the Radius fields above; default 5 km). Green pin = comparable meets the criteria, "
+                "orange = distance OK but area outside tolerance, gray = outside the radius."
+            ))
+            if _n_spread:
+                st.caption(t(f"ℹ️ {_n_spread} pembanding punya koordinat yang sama (lokasi listing hanya sebatas kelurahan/kecamatan), jadi pin-nya digeser sedikit agar tidak menumpuk. Posisi pin bukan alamat persis.",
+                             f"ℹ️ {_n_spread} comparables share the same coordinates (listing location is only area-level), so their pins are nudged slightly apart. Pin position isn't the exact address."))
+            if not st.session_state.comparables:
+                st.caption(t("Pin pembanding akan muncul di peta setelah pencarian dijalankan.",
+                             "Comparable pins will appear on the map after the search runs."))
+            elif _n_nocoord:
+                st.caption(t(f"⚠ {_n_nocoord} pembanding belum punya koordinat, jadi tidak muncul di peta.",
+                             f"⚠ {_n_nocoord} comparable(s) have no coordinates, so they aren't shown on the map."))
+        except ImportError:
+            st.warning(t("Peta butuh paket folium & streamlit-folium (lihat requirements.txt).",
+                         "The map needs the folium & streamlit-folium packages (see requirements.txt)."))
+    else:
+        st.info(t("Peta muncul setelah koordinat properti subjek tersedia (Step 1).",
+                  "The map appears once the subject property's coordinates are available (Step 1)."))
+
     if not st.session_state.comparables:
         st.subheader(t("Cari Properti Pembanding", "Search for Comparable Properties"))
         st.session_state.comparable_count = st.number_input(
             t("Jumlah pembanding yang dicari", "Number of comparables to search for"), min_value=1, max_value=50,
             value=st.session_state.comparable_count, step=1,
-            help=t("Default 15 - appraiser bebas menyesuaikan jumlah pembanding yang ingin dicari.",
-                   "Default 15 - the appraiser is free to adjust how many comparables to search for."),
+            help=t("Default 5 - sistem akan mencari terus sampai jumlah ini terpenuhi (hanya yang berada di dalam radius).",
+                   "Default 5 - the system keeps searching until this many are found (only ones inside the radius)."),
         )
         if st.button(t("🔍 Mulai Pencarian", "🔍 Start Search"), type="primary"):
             # Dipakai search_comparables_until_target untuk PENCARIAN OTOMATIS
@@ -1866,13 +2338,14 @@ elif st.session_state.step == 6:
                     t("Harga Bangunan (Estimasi)", "Building Price (Estimate)"),
                     fmt_rp(hb) if hb is not None else "N/A",
                     help=t(
-                        "Estimasi = Luas Bangunan pembanding × BRB/m² (Biaya Reproduksi Baru) "
-                        "dari Step 3 (kalau Step 3 belum diisi, pakai default Rp 5.000.000/m²). "
-                        "Bukan hasil cost approach penuh - hanya perkiraan kasar untuk pembanding.",
-                        "Estimate = this comparable's Building Area × BRB/m² (New Reproduction "
-                        "Cost) from Step 3 (defaults to Rp 5,000,000/m² if Step 3 isn't filled "
-                        "in yet). Not a full cost approach result - just a rough estimate for "
-                        "comparison."
+                        f"Estimasi = Luas Bangunan pembanding × BRB/m² (Biaya Reproduksi Baru) "
+                        f"dari Step 3 (kalau Step 3 belum diisi, pakai default {fmt_rp(calc.BRB_DEFAULT_PER_M2)}/m² "
+                        "- BTB MAPPI 2025 x IKK BPS 2025, Surabaya, R. Tinggal Menengah). Bukan hasil "
+                        "cost approach penuh - hanya perkiraan kasar untuk pembanding.",
+                        f"Estimate = this comparable's Building Area × BRB/m² (New Reproduction "
+                        f"Cost) from Step 3 (defaults to {fmt_rp(calc.BRB_DEFAULT_PER_M2)}/m² if Step 3 isn't "
+                        "filled in yet - BTB MAPPI 2025 x BPS IKK 2025, Surabaya, Medium Residential). "
+                        "Not a full cost approach result - just a rough estimate for comparison."
                     ),
                 )
                 ht = c.get("harga_tanah_estimasi")
@@ -1921,11 +2394,80 @@ elif st.session_state.step == 6:
                 if c.get("catatan"):
                     st.caption(f"ℹ️ {c['catatan']}")
 
+                if c.get("lokasi_perkiraan"):
+                    st.caption(t("📍 Lokasi perkiraan (titik tengah wilayah, bukan alamat persis) — jarak bisa kurang akurat; "
+                                 "edit alamat/koordinat di bawah kalau perlu.",
+                                 "📍 Approximate location (area centroid, not the exact address) — distance may be less accurate; "
+                                 "edit the address/coordinates below if needed."))
+
+                with st.expander(t("✏️ Edit pembanding ini", "✏️ Edit this comparable")):
+                    with st.form(f"edit_comp_form_{i}"):
+                        e_alamat = st.text_input(t("Alamat", "Address"), value=c.get("alamat") or "")
+                        ec1, ec2, ec3, ec4 = st.columns(4)
+                        e_harga = ec1.number_input(t("Harga (Rp)", "Price (Rp)"), min_value=0.0, step=1_000_000.0,
+                                                   value=float(c.get("harga") or 0))
+                        e_lt = ec2.number_input("LT (m²)", min_value=0.0, step=1.0, value=float(c.get("luas_tanah") or 0))
+                        e_lb = ec3.number_input("LB (m²)", min_value=0.0, step=1.0, value=float(c.get("luas_bangunan") or 0))
+                        _thn0 = int(c.get("tahun_bangun") or 2015)
+                        e_thn = ec4.number_input(t("Tahun", "Year"), min_value=1900, max_value=2100,
+                                                 value=min(max(_thn0, 1900), 2100))
+                        ec5, ec6 = st.columns(2)
+                        e_link = ec5.text_input("Link", value=c.get("link") or "")
+                        e_sumber = ec6.text_input(t("Sumber", "Source"), value=c.get("sumber") or "")
+                        e_tgl = st.text_input(t("Tanggal Upload Listing", "Listing Upload Date"),
+                                              value=c.get("tanggal_upload") or "")
+                        e_catatan = st.text_input(t("Catatan", "Notes"), value=c.get("catatan") or "")
+                        ec7, ec8 = st.columns(2)
+                        e_lat = ec7.number_input("Latitude", format="%.6f", value=float(c.get("lat") or 0.0))
+                        e_lon = ec8.number_input("Longitude", format="%.6f", value=float(c.get("lon") or 0.0))
+                        st.caption(t("Ubah alamat → lokasi & jarak dihitung ulang otomatis. Atau isi Latitude/Longitude "
+                                     "sendiri untuk lokasi yang persis (prioritas atas alamat).",
+                                     "Change the address → location & distance are recalculated automatically. Or enter "
+                                     "your own Latitude/Longitude for an exact location (takes priority over the address)."))
+                        fs1, fs2 = st.columns(2)
+                        _saved = fs1.form_submit_button(t("💾 Simpan perubahan", "💾 Save changes"), type="primary")
+                        _deleted = fs2.form_submit_button(t("🗑️ Hapus pembanding ini", "🗑️ Delete this comparable"))
+
+                    if _saved:
+                        _addr_changed = e_alamat.strip() != (c.get("alamat") or "").strip()
+                        _coord_changed = (abs(e_lat - float(c.get("lat") or 0.0)) > 1e-7
+                                          or abs(e_lon - float(c.get("lon") or 0.0)) > 1e-7)
+                        c.update({
+                            "alamat": e_alamat.strip(), "harga": e_harga, "luas_tanah": e_lt,
+                            "luas_bangunan": e_lb, "tahun_bangun": e_thn, "link": e_link.strip(),
+                            "sumber": e_sumber.strip() or "Manual", "tanggal_upload": e_tgl.strip() or None,
+                            "catatan": e_catatan.strip(),
+                        })
+                        if _coord_changed and e_lat and e_lon:
+                            c["lat"], c["lon"] = e_lat, e_lon
+                            c["distance_km"] = (
+                                round(calc.haversine_km(subjek_lat, subjek_lon, e_lat, e_lon), 2)
+                                if subjek_lat is not None and subjek_lon is not None else None
+                            )
+                            c["lokasi_perkiraan"] = False
+                        elif _addr_changed:
+                            c["lat"] = c["lon"] = c["distance_km"] = None   # di-geocode ulang di enrich_comp
+                            c["lokasi_perkiraan"] = False
+                        c["_include_auto_set"] = False   # jangan timpa centang appraiser
+                        enrich_comp(c, subjek, subjek_harga_per_m2, st.session_state.radius_km,
+                                    st.session_state.luas_tanah_toleransi_pct,
+                                    st.session_state.luas_bangunan_toleransi_pct, subjek_lat, subjek_lon,
+                                    znt_per_m2=znt_subjek_step6, brb_per_m2=brb_subjek_step6)
+                        st.rerun()
+                    if _deleted:
+                        st.session_state.comparables.pop(i)
+                        for _k in [k for k in st.session_state.keys() if str(k).startswith("inc_")]:
+                            st.session_state.pop(_k, None)
+                        st.rerun()
+
         col_more1, col_more2 = st.columns([2, 1])
         with col_more1:
             add_n = st.number_input(
-                t("Tambah berapa pembanding lagi?", "How many more comparables to add?"), min_value=5, max_value=30, value=10, step=5,
+                t("Jumlah pembanding yang dicari (tambahan)", "Number of comparables to search for (additional)"),
+                min_value=1, max_value=30, value=5, step=1,
                 key="add_n_comparables",
+                help=t("Sistem akan menambahkan sebanyak ini pembanding BARU (hanya yang berada di dalam radius).",
+                       "The system will add this many NEW comparables (only ones inside the radius)."),
             )
         with col_more2:
             st.write("")
@@ -2127,9 +2669,29 @@ elif st.session_state.step == 8:
     st.session_state.rentang_nilai_pasar = rentang
 
     st.markdown(t("**📊 Rentang Nilai Pasar**", "**📊 Market Value Range**"))
+    # Titik Estimasi bisa diedit appraiser. Default = hasil hitung otomatis; kalau hasil
+    # hitung berubah (mis. pembanding dicentang ulang), kolom di-reset ke angka otomatis baru.
+    _point_auto = float(rentang["point"])
+    if st.session_state.get("_titik_auto_prev") != _point_auto:
+        st.session_state["titik_estimasi_input"] = _point_auto
+        st.session_state["_titik_auto_prev"] = _point_auto
     rc1, rc2 = st.columns(2)
     rc1.metric(t("Rentang", "Range"), f"{fmt_rp(rentang['min'])} – {fmt_rp(rentang['max'])}")
-    rc2.metric(t("Titik Estimasi (Point)", "Estimate Point"), fmt_rp(rentang['point']))
+    with rc2:
+        _point_edit = st.number_input(
+            t("Titik Estimasi (Point) — bisa diedit", "Estimate Point — editable"),
+            min_value=0.0, step=1_000_000.0, key="titik_estimasi_input",
+            help=t(f"Otomatis: {fmt_rp(_point_auto)}. Ubah angka ini kalau appraiser punya pertimbangan lain.",
+                   f"Automatic: {fmt_rp(_point_auto)}. Change this if the appraiser has other considerations."),
+        )
+        if _point_edit != _point_auto:
+            st.caption(t(f"✏️ Diedit manual (otomatis: {fmt_rp(_point_auto)})",
+                         f"✏️ Manually edited (automatic: {fmt_rp(_point_auto)})"))
+            if _point_edit < rentang["min"] or _point_edit > rentang["max"]:
+                st.warning(t("Titik Estimasi berada di luar Rentang di atas.",
+                             "The Estimate Point is outside the Range above."))
+    rentang["point"] = float(_point_edit)
+    st.session_state.rentang_nilai_pasar = rentang
     st.caption(t("Rentang = batas terendah & tertinggi dari (Nilai Pasar Awal, Minimum Pembanding, "
                 "Maximum Pembanding). Titik Estimasi = rata-rata Nilai Pasar Awal & MEDIAN pembanding "
                 "(median dipakai, bukan average, supaya titik estimasi tidak gampang tertarik oleh "
@@ -2398,7 +2960,7 @@ elif st.session_state.step == 11:
         report_lines.append("## 3. Building Value Result (Cost Approach)")
         depresiasi_detail = bgn.get("depresiasi_detail", {})
         metode_label = "Percentage / Declining Balance" if depresiasi_detail.get("metode") == "persentase_tetap" else "Straight Line"
-        report_lines.append(f"- Classification: {bgn.get('klasifikasi')} | BRB: {fmt_rp(bgn.get('brb'))}")
+        report_lines.append(f"- Classification: {bgn.get('klasifikasi')} | BRB: {fmt_rp(bgn.get('brb'))} | Number of Floors: {bgn.get('jumlah_lantai', '-')}")
         report_lines.append(f"- Depreciation Method: {metode_label}")
         if depresiasi_detail.get("metode") == "persentase_tetap":
             report_lines.append(
@@ -2533,7 +3095,7 @@ elif st.session_state.step == 11:
         report_lines.append("## 3. Hasil Nilai Bangunan (Cost Approach)")
         depresiasi_detail = bgn.get("depresiasi_detail", {})
         metode_label = "Persentase Tetap (Declining Balance)" if depresiasi_detail.get("metode") == "persentase_tetap" else "Garis Lurus (Straight Line)"
-        report_lines.append(f"- Klasifikasi: {bgn.get('klasifikasi')} | BRB: {fmt_rp(bgn.get('brb'))}")
+        report_lines.append(f"- Klasifikasi: {bgn.get('klasifikasi')} | BRB: {fmt_rp(bgn.get('brb'))} | Jumlah Lantai: {bgn.get('jumlah_lantai', '-')}")
         report_lines.append(f"- Metode Penyusutan: {metode_label}")
         if depresiasi_detail.get("metode") == "persentase_tetap":
             report_lines.append(

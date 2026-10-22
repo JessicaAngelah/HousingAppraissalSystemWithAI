@@ -544,6 +544,37 @@ def _is_category_page(url: str) -> bool:
     return False
 
 
+_LISTING_DOMAINS = ("rumah123.com", "99.co", "olx.co.id", "pinhome.id", "lamudi.co.id",
+                    "raywhite.co.id", "era.id", "eraindonesia.com", "dotproperty.id")
+_NON_HOUSE_URL_WORDS = ("komersial", "ruko", "rukan", "apartemen", "apartment", "kondotel", "gudang",
+                        "kantor", "pabrik", "hotel", "kavling", "tanah-dijual", "/tanah/", "villa",
+                        "-tanah-", "warehouse", "office", "commercial", "shophouse")
+
+
+def _is_single_house_listing_url(url: str) -> bool:
+    """Ketat: True HANYA kalau URL tampak seperti SATU listing RUMAH di situs listing
+    yang dikenal - domain harus ada di daftar, segmen terakhir path harus memuat
+    angka (ID unik listing), dan path tidak menyebut tipe non-rumah (ruko/apartemen/
+    tanah/komersial/...). Artikel, blog, halaman kategori, dan hasil pencarian tidak lolos."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url or "")
+    except ValueError:
+        return False
+    host = (u.netloc or "").lower()
+    if not any(d in host for d in _LISTING_DOMAINS):
+        return False
+    path = (u.path or "").rstrip("/").lower()
+    if not path:
+        return False
+    last = path.rsplit("/", 1)[-1]
+    if not re.search(r"\d", last):
+        return False
+    if any(w in path for w in _NON_HOUSE_URL_WORDS):
+        return False
+    return True
+
+
 def _fetch_listing_page(url: str, timeout: int = 8) -> str:
     """
     Ambil teks polos dari halaman listing (harga/luas biasanya lebih lengkap
@@ -638,8 +669,20 @@ def run_comparable_agent(alamat: str, kecamatan: str, kabkota: str, provinsi: st
                           luas_bangunan_toleransi_pct: float = 0.20,
                           geocode_comparables: bool = True,
                           search_page: int = 1,
+                          rejected_links: set = None,
+                          strict_radius: bool = True,
+                          query_variant: int = 1,
                           lang: str = "id"):
     """
+    strict_radius (default True): kalau koordinat subjek tersedia, SETIAP kandidat
+    di-geocode dulu SEBELUM dipotong ke max_results, lalu pembanding yang lokasinya
+    tidak bisa diverifikasi atau berada di LUAR radius_km DIBUANG (tidak ditambahkan
+    ke daftar). Yang ukuran LT/LB-nya di luar toleransi TETAP boleh masuk (asal
+    masih di dalam radius) sebagai pengisi kalau yang sesuai ukuran kurang.
+    rejected_links (opsional, set): diisi dengan link yang sudah dicek tapi dibuang
+    (di luar radius / lokasi tak terverifikasi) supaya ronde berikutnya tidak
+    mengecek ulang listing yang sama.
+
     Mencari properti pembanding dari beberapa situs listing lewat Serper,
     mem-fetch halaman listing yang bisa diakses langsung untuk detail harga/luas
     yang lebih lengkap, lalu memakai LLM untuk mengekstrak baris terstruktur
@@ -731,7 +774,29 @@ def run_comparable_agent(alamat: str, kecamatan: str, kabkota: str, provinsi: st
     if lt_max > lt_min:
         queries.append(("Google", f"tanah rumah dijual {location_str} luas tanah {int(lt_min)}m2"))
         queries.append(("Google", f"tanah rumah dijual {location_str} luas tanah {int(lt_max)}m2"))
+    # Query berbasis lokasi persis subjek (nama jalan/perumahan) supaya hasil
+    # dominan listing yang benar-benar DEKAT, bukan sekadar satu kecamatan/kota.
+    _alamat_pendek = (alamat or "").split(",")[0].strip()
+    if _alamat_pendek:
+        queries.append(("Google", f"rumah dijual dekat {_alamat_pendek} {kecamatan} {kabkota}"))
+        queries.append(("Google", f"rumah dijual {_alamat_pendek} {kecamatan} harga luas tanah luas bangunan"))
 
+
+    # Ronde lanjutan (query_variant >= 2): halaman Google berikutnya dari query yang SAMA
+    # cepat habis / berulang, jadi tambahkan query dengan kata kunci BERBEDA (tipe rumah,
+    # fasilitas, kondisi, dll) supaya listing lain di radius yang sama ikut terjaring.
+    if query_variant and query_variant >= 2:
+        _mods = ["cluster", "perumahan", "2 lantai", "1 lantai", "SHM", "lokasi strategis",
+                 "bebas banjir", "jalan lebar", "hook", "siap huni", "nego", "dekat tol",
+                 "dekat stasiun", "dekat sekolah", "kawasan elite", "row jalan 2 mobil"]
+        _start = ((query_variant - 2) * 4) % len(_mods)
+        _picked = [_mods[(_start + k) % len(_mods)] for k in range(4)]
+        _site_cycle = ["site:rumah123.com", "site:99.co", "site:olx.co.id", "site:lamudi.co.id",
+                       "site:pinhome.id", "site:dotproperty.id"]
+        for k, _m in enumerate(_picked):
+            queries.append(("Google", f"rumah dijual {location_str} {_m} luas tanah {int(luas_tanah)}m2 harga"))
+            _sf = _site_cycle[(query_variant + k) % len(_site_cycle)]
+            queries.append(("Google", f"rumah dijual {kecamatan} {kabkota} {_m} {_sf}"))
 
     all_organic = []
     # PENTING (kecepatan): dulu 14 query (8 situs + ~6 query Google umum)
@@ -788,6 +853,14 @@ def run_comparable_agent(alamat: str, kecamatan: str, kabkota: str, provinsi: st
             f"✓ {n_filtered_out} category/listing-index pages discarded "
             f"(e.g. '.../jual/{{city}}/{{district}}/rumah/' pages that list hundreds/thousands "
             "of properties at once, not a single specific property)."))
+    _n_before_strict = len(deduped)
+    deduped = [o for o in deduped if _is_single_house_listing_url(o.get("link", ""))]
+    if _n_before_strict - len(deduped):
+        log.append(t(
+            f"✓ {_n_before_strict - len(deduped)} hasil dibuang karena bukan listing rumah tunggal "
+            "(bukan situs listing, halaman daftar/artikel, atau tipe ruko/apartemen/tanah/komersial).",
+            f"✓ {_n_before_strict - len(deduped)} results discarded because they are not single-house listings "
+            "(not a listing site, list/article page, or shophouse/apartment/land/commercial type)."))
     if not deduped:
         log.append(t("⚠ Semua hasil ternyata halaman kategori, tidak ada listing spesifik yang tersisa.",
                       "⚠ All results turned out to be category pages, no specific listings remain."))
@@ -819,6 +892,12 @@ def run_comparable_agent(alamat: str, kecamatan: str, kabkota: str, provinsi: st
                     if page_text:
                         o["_page_detail"] = page_text
                         n_fetched += 1
+        _list_pat = re.compile(r"(menampilkan|ditemukan|ada|showing)\s+[\d.,]{2,}\s+(properti|unit|hasil|listing|rumah|results?)", re.I)
+        _before_pg = len(deduped)
+        deduped = [o for o in deduped if not (o.get("_page_detail") and _list_pat.search(o["_page_detail"][:1500]))]
+        if _before_pg - len(deduped):
+            log.append(t(f"✓ {_before_pg - len(deduped)} halaman ternyata daftar banyak properti (bukan satu listing) dibuang.",
+                         f"✓ {_before_pg - len(deduped)} pages turned out to be multi-property lists (not a single listing) and were discarded."))
         log.append(t(f"✓ {n_fetched} halaman berhasil diambil detailnya",
                       f"✓ {n_fetched} pages successfully fetched in detail"))
 
@@ -950,6 +1029,13 @@ def run_comparable_agent(alamat: str, kecamatan: str, kabkota: str, provinsi: st
         "kalau memang disebut eksplisit di teks/detail halaman (biasanya di dekat penanda "
         "'TglListing:', 'diperbarui', 'diposting', 'hari lalu'). JANGAN mengisi tanggal hari "
         "ini atau tanggal pencarian sebagai pengganti - kalau tidak disebutkan, isi null. "
+        "alamat: tulis SELENGKAP mungkin dari teks (nama jalan/perumahan/cluster, kelurahan, "
+        "kecamatan, kota) karena alamat ini akan di-geocode untuk memastikan lokasinya berada "
+        "di sekitar subjek - JANGAN mengarang bagian alamat yang tidak ada di teks. "
+        "HANYA sertakan listing RUMAH/perumahan hunian (bukan ruko, rukan, kantor, gudang, pabrik, apartemen, "
+        "kavling/tanah kosong, hotel, atau properti komersial lain) yang punya ALAMAT SPESIFIK di teks "
+        "(minimal nama jalan/perumahan/cluster ATAU kelurahan/kecamatan). Kalau alamatnya cuma nama kota/provinsi "
+        "(mis. 'DKI Jakarta', 'Jakarta Selatan') tanpa jalan/kelurahan/kecamatan, LEWATI listing tsb - jangan ditebak. "
         "catatan: keterangan singkat (maks 80 karakter) jika ada hal relevan (mis. ukuran "
         "jauh dari toleransi, harga negotiable, dll), boleh string kosong."
     )
@@ -1056,19 +1142,7 @@ def run_comparable_agent(alamat: str, kecamatan: str, kabkota: str, provinsi: st
 
     comps.sort(key=lambda c: 0 if _dalam_rentang(c) else 1)
     n_dalam_rentang = sum(1 for c in comps if _dalam_rentang(c))
-    comps = comps[:max_results]
-    n_dalam_rentang_final = sum(1 for c in comps if _dalam_rentang(c))
-    log.append(t(f"✓ {len(comps)} properti pembanding ditemukan (harga+LT+LB lengkap)",
-                  f"✓ {len(comps)} comparable properties found (complete price+land+building area)"))
-    log.append(t(
-        f"✓ {n_dalam_rentang_final}/{len(comps)} di antaranya sudah sesuai rentang toleransi "
-        f"LT {lt_min:.0f}-{lt_max:.0f} m2 & LB {lb_min:.0f}-{lb_max:.0f} m2 "
-        f"(dari total {n_dalam_rentang} yang ditemukan sebelum dipotong ke {max_results}) "
-        "- yang sesuai rentang selalu diprioritaskan lebih dulu.",
-        f"✓ {n_dalam_rentang_final}/{len(comps)} of these already fit the tolerance range "
-        f"land area {lt_min:.0f}-{lt_max:.0f} m2 & building area {lb_min:.0f}-{lb_max:.0f} m2 "
-        f"(out of {n_dalam_rentang} found before trimming to {max_results}) "
-        "- in-range comparables are always prioritized first."))
+    subjek = {"luas_tanah": luas_tanah, "luas_bangunan": luas_bangunan}
     if n_incomplete:
         log.append(t(
             f"⚠ {n_incomplete} listing dilewati karena harga/LT/LB tidak lengkap "
@@ -1076,74 +1150,132 @@ def run_comparable_agent(alamat: str, kecamatan: str, kabkota: str, provinsi: st
             f"⚠ {n_incomplete} listings skipped because price/land/building area was incomplete "
             f"in the automatic extraction - check manually or add via the form if needed."))
 
-    subjek = {"luas_tanah": luas_tanah, "luas_bangunan": luas_bangunan}
+    # Filter kualitas: buang listing komersial & listing yang alamatnya terlalu umum
+    # (cuma kota/provinsi) - lokasinya tidak bisa diverifikasi jadi jaraknya menyesatkan.
+    _KOMERSIAL = ("ruko", "rukan", "ruang usaha", "kantor", "gudang", "pabrik", "apartemen",
+                  "apartment", "kavling", "kavlingan", "tanah kosong", "hotel", "kost ", "kos-kosan",
+                  "komersial", "commercial", "warehouse", "office", "shophouse")
+    _GENERIK = {"dki", "jakarta", "indonesia", "kota", "kabupaten", "kab", "provinsi", "prov", "dki jakarta",
+                "pusat", "selatan", "utara", "barat", "timur", "lokasi", "tidak", "spesifik", "kampung"}
 
-    if geocode_comparables and comps:
-        log.append(t(f"Menghitung jarak pembanding (radius maksimum {radius_km:g} km)...",
-                      f"Calculating comparable distances (maximum radius {radius_km:g} km)..."))
-        for i, c in enumerate(comps):
-            alamat_asli = (c.get("alamat") or "").strip()
-            ok_geo, geo = (False, None)
-            if alamat_asli:
-                # Percobaan 1: alamat pembanding + konteks kecamatan/kabkota/
-                # provinsi SUBJEK. Ini akurat SELAMA pembanding memang ada di
-                # area yang sama dengan subjek.
-                ok_geo, geo = geocode_address(f"{alamat_asli}, {kecamatan}, {kabkota}, {provinsi}")
-                # PENTING - BUG YANG DIPERBAIKI: fallback SEBELUMNYA di sini
-                # mengganti query jadi HANYA "{kecamatan}, {kabkota}, {provinsi}"
-                # (konteks SUBJEK saja, alamat pembanding yang asli dibuang).
-                # Ini choose menyesatkan: kalau alamat pembanding sebenarnya di
-                # kota LAIN (mis. "..., Tangerang, Banten") sehingga query
-                # gabungan #1 di atas gagal (kontradiktif - Nominatim tidak
-                # bisa mencocokkan alamat Tangerang dengan konteks kab/kota
-                # subjek), fallback lama itu MEMAKSA titik pembanding
-                # ditempatkan tepat di sekitar kecamatan SUBJEK - membuat
-                # jarak yang dihitung jadi kecil/salah (mis. "4.23 km")
-                # padahal properti itu SEBENARNYA jauh (di Tangerang/Banten,
-                # bukan di area subjek sama sekali) dan seharusnya malah
-                # disingkirkan oleh filter radius, bukan lolos dengan jarak
-                # palsu. Perbaikan: fallback sekarang geocode alamat
-                # pembanding APA ADANYA (tanpa konteks subjek yang
-                # dipaksakan) supaya titik yang ditemukan adalah lokasi ASLI
-                # listing tsb (betul di Tangerang kalau memang di sana),
-                # sehingga jarak yang dihitung akurat dan filter radius bisa
-                # menyaring pembanding yang lokasinya jauh/beda kota dengan
-                # semestinya.
-                if not ok_geo:
-                    ok_geo, geo = geocode_address(alamat_asli)
-            if ok_geo and geo:
-                c["lat"], c["lon"] = geo["lat"], geo["lon"]
-                if subjek_lat is not None and subjek_lon is not None:
-                    c["distance_km"] = round(
-                        calc.haversine_km(subjek_lat, subjek_lon, geo["lat"], geo["lon"]), 2
-                    )
+    def _norm_tokens(x):
+        import re as _re
+        return [w for w in _re.split(r"[^a-z0-9]+", (x or "").lower()) if w]
+
+    def _alamat_terlalu_umum(c):
+        toks = _norm_tokens(c.get("alamat"))
+        skip = set(_norm_tokens(provinsi)) | set(_norm_tokens(kabkota)) | _GENERIK
+        bermakna = [w for w in toks if w not in skip and not w.isdigit()]
+        return len(bermakna) == 0
+
+    def _komersial(c):
+        blob = " ".join(str(c.get(k) or "") for k in ("alamat", "catatan", "link")).lower()
+        return any(k in blob for k in _KOMERSIAL)
+
+    _n_kom = _n_umum = 0
+    _filtered = []
+    for c in comps:
+        if _komersial(c):
+            _n_kom += 1
+            if rejected_links is not None and c.get("link"):
+                rejected_links.add(c["link"])
+            continue
+        if _alamat_terlalu_umum(c):
+            _n_umum += 1
+            if rejected_links is not None and c.get("link"):
+                rejected_links.add(c["link"])
+            continue
+        _filtered.append(c)
+    comps = _filtered
+    if _n_kom or _n_umum:
+        log.append(t(
+            f"⚠ {_n_kom} listing komersial (ruko/kantor/gudang/apartemen/kavling) dan {_n_umum} listing dengan "
+            "alamat terlalu umum (hanya kota/provinsi) dibuang.",
+            f"⚠ {_n_kom} commercial listings (shophouse/office/warehouse/apartment/plot) and {_n_umum} listings "
+            "with too-generic addresses (city/province only) were discarded."))
+
+    # Tipe hasil geocode yang cuma berupa titik tengah wilayah (kelurahan/kecamatan/kota),
+    # bukan alamat/bangunan - jaraknya hanya perkiraan.
+    COARSE_TYPES = {"administrative", "suburb", "neighbourhood", "quarter", "village", "city",
+                    "town", "city_district", "county", "state", "region", "postcode", "boundary",
+                    "hamlet", "municipality", "district"}
+
+    def _geocode_comp(c):
+        """Geocode satu pembanding (Nominatim -> fallback Google Places via Serper)."""
+        alamat_asli = (c.get("alamat") or "").strip()
+        if not alamat_asli:
+            return None
+        for q in (f"{alamat_asli}, {kecamatan}, {kabkota}, {provinsi}", alamat_asli):
+            ok_geo, res, _src = geocode_search_with_places_fallback(q, serper=serper, limit=3)
+            if ok_geo and res:
+                return res[0]
+        return None
+
+    def _apply_geo(c, geo):
+        c["lat"], c["lon"] = geo["lat"], geo["lon"]
+        if subjek_lat is not None and subjek_lon is not None:
+            c["distance_km"] = round(calc.haversine_km(subjek_lat, subjek_lon, geo["lat"], geo["lon"]), 2)
+        else:
+            c["distance_km"] = None
+        _hasil = geo.get("display_name") or ""
+        c["lokasi_hasil_geocode"] = _hasil
+        c["lokasi_provinsi_cocok"] = (not provinsi or not _hasil or provinsi.strip().lower() in _hasil.lower())
+        c["lokasi_perkiraan"] = (geo.get("type") or "").lower() in COARSE_TYPES
+
+    can_verify = bool(geocode_comparables and strict_radius and subjek_lat is not None and subjek_lon is not None)
+
+    if can_verify:
+        # Geocode DULU (sebelum dipotong), berhenti begitu sudah cukup pembanding valid.
+        # comps sudah diurut: yang LT&LB-nya sesuai toleransi didahulukan.
+        log.append(t(
+            f"Memverifikasi lokasi kandidat (hanya yang berada dalam radius {radius_km:g} km yang dipakai)...",
+            f"Verifying candidate locations (only those within {radius_km:g} km are kept)..."))
+        kept, n_out, n_unverified, n_checked = [], 0, 0, 0
+        geo_cap = min(len(comps), max(30, min(max_results * 2, 60)))
+        for c in comps[:geo_cap]:
+            if len(kept) >= max_results:
+                break
+            n_checked += 1
+            geo = _geocode_comp(c)
+            if not geo:
+                n_unverified += 1
+                if rejected_links is not None and c.get("link"):
+                    rejected_links.add(c["link"])
+                continue
+            _apply_geo(c, geo)
+            # Titik tengah kota/provinsi/kabupaten = lokasi asli tidak diketahui -> buang.
+            if (geo.get("type") or "").lower() in {"city", "town", "state", "county", "region",
+                                                    "municipality", "province", "country", "state_district"}:
+                n_unverified += 1
+                if rejected_links is not None and c.get("link"):
+                    rejected_links.add(c["link"])
+                continue
+            # Hanya JARAK yang jadi penyaring keras. Kecocokan nama provinsi di teks geocode TIDAK dipakai
+            # membuang (penulisan bisa beda, mis. "DKI Jakarta" vs "Daerah Khusus Ibukota Jakarta"),
+            # cukup jadi penanda di c["lokasi_provinsi_cocok"].
+            if c["distance_km"] is None or c["distance_km"] > radius_km:
+                n_out += 1
+                if rejected_links is not None and c.get("link"):
+                    rejected_links.add(c["link"])
+                continue
+            kept.append(c)
+        log.append(t(
+            f"✓ {len(kept)} dalam radius, {n_out} dibuang (di luar radius/area), "
+            f"{n_unverified} dibuang (lokasi tidak bisa diverifikasi) dari {n_checked} yang dicek.",
+            f"✓ {len(kept)} within radius, {n_out} discarded (outside radius/area), "
+            f"{n_unverified} discarded (location could not be verified) out of {n_checked} checked."))
+        comps = kept
+    else:
+        comps = comps[:max_results]
+        if geocode_comparables and comps:
+            log.append(t(f"Menghitung jarak pembanding (radius maksimum {radius_km:g} km)...",
+                          f"Calculating comparable distances (maximum radius {radius_km:g} km)..."))
+            for c in comps:
+                geo = _geocode_comp(c)
+                if geo:
+                    _apply_geo(c, geo)
                 else:
-                    c["distance_km"] = None
-                # Cek sanity tambahan: kalau nama provinsi SUBJEK sama sekali
-                # tidak muncul di display_name hasil geocode (mis. provinsi
-                # subjek "DKI Jakarta" tapi hasil geocode "..., Tangerang,
-                # Banten, Indonesia"), tandai supaya appraiser tahu titik
-                # yang ditemukan kemungkinan bukan properti yang dimaksud -
-                # walau jarak yang dihitung kebetulan kecil/masuk radius.
-                _provinsi_hasil = (geo.get("display_name") or "")
-                c["lokasi_hasil_geocode"] = _provinsi_hasil
-                c["lokasi_provinsi_cocok"] = (
-                    not provinsi or not _provinsi_hasil or provinsi.strip().lower() in _provinsi_hasil.lower()
-                )
-            else:
-                c["lat"], c["lon"], c["distance_km"] = None, None, None
-            # CATATAN: dulu ada time.sleep(1.05) manual tambahan di sini untuk
-            # mematuhi batas ~1 request/detik Nominatim - sekarang REDUNDAN
-            # dan dihapus karena geocode.py sendiri sudah menerapkan throttle
-            # GLOBAL (lihat _throttle() di geocode.py) sebelum SETIAP request
-            # ke Nominatim, termasuk yang dipanggil dari sini lewat
-            # geocode_address(). Sleep tambahan di sini dulu membuat jeda
-            # antar-pembanding jadi dobel (throttle internal + sleep manual),
-            # jadi menghapusnya mempercepat pencarian tanpa melanggar
-            # kebijakan rate-limit Nominatim.
-        n_with_dist = sum(1 for c in comps if c.get("distance_km") is not None)
-        log.append(t(f"✓ {n_with_dist}/{len(comps)} pembanding berhasil dihitung jaraknya",
-                      f"✓ {n_with_dist}/{len(comps)} comparables had their distance calculated successfully"))
+                    c["lat"], c["lon"], c["distance_km"] = None, None, None
 
     if subjek_lat is not None and subjek_lon is not None:
         for c in comps:
@@ -1155,17 +1287,20 @@ def run_comparable_agent(alamat: str, kecamatan: str, kabkota: str, provinsi: st
             c["luas_ok"] = kriteria["luas_ok"]
             c["jarak_ok"] = kriteria["jarak_ok"]
             c["memenuhi_kriteria"] = kriteria["ok"]
+        # Yang ukurannya sesuai toleransi dulu, lalu yang terdekat.
+        comps.sort(key=lambda c: (0 if c.get("luas_ok") else 1, c.get("distance_km") if c.get("distance_km") is not None else 9e9))
+        comps = comps[:max_results]
         n_ok = sum(1 for c in comps if c.get("memenuhi_kriteria"))
         log.append(t(
-            f"✓ {n_ok}/{len(comps)} pembanding memenuhi kriteria "
-            f"(luas tanah ±{luas_tanah_toleransi_pct*100:.0f}%, "
-            f"luas bangunan ±{luas_bangunan_toleransi_pct*100:.0f}%, "
-            f"radius {radius_km:g} km) - sisanya tetap ditampilkan tapi ditandai di luar kriteria.",
-            f"✓ {n_ok}/{len(comps)} comparables meet the criteria "
-            f"(land area ±{luas_tanah_toleransi_pct*100:.0f}%, "
-            f"building area ±{luas_bangunan_toleransi_pct*100:.0f}%, "
-            f"radius {radius_km:g} km) - the rest are still shown but flagged as out of criteria."
-        ))
+            f"✓ {len(comps)} pembanding di dalam radius {radius_km:g} km, {n_ok} di antaranya juga sesuai "
+            f"toleransi luas (LT ±{luas_tanah_toleransi_pct*100:.0f}%, LB ±{luas_bangunan_toleransi_pct*100:.0f}%); "
+            "sisanya luasnya berbeda tapi masih di area yang sama.",
+            f"✓ {len(comps)} comparables within {radius_km:g} km, {n_ok} of them also within the area tolerance "
+            f"(land ±{luas_tanah_toleransi_pct*100:.0f}%, building ±{luas_bangunan_toleransi_pct*100:.0f}%); "
+            "the rest differ in size but are still in the same area."))
+    else:
+        log.append(t(f"✓ {len(comps)} properti pembanding ditemukan (harga+LT+LB lengkap)",
+                      f"✓ {len(comps)} comparable properties found (complete price+land+building area)"))
 
     return log, comps
 
@@ -1174,7 +1309,7 @@ def search_comparables_until_target(
     alamat, kecamatan, kabkota, provinsi, luas_tanah, luas_bangunan,
     serper, groq, gemini, target: int, subjek_lat=None, subjek_lon=None,
     radius_km: float = 5.0, luas_tanah_toleransi_pct: float = 0.20,
-    luas_bangunan_toleransi_pct: float = 0.20, max_rounds: int = 10,
+    luas_bangunan_toleransi_pct: float = 0.20, max_rounds: int = 15,
     progress_cb=None, exclude_links=None, lang: str = "id",
 ):
     """
@@ -1227,6 +1362,7 @@ def search_comparables_until_target(
     (dedup by link) dari semua ronde, TIDAK termasuk exclude_links.
     """
     all_comps = []
+    rejected = set()
     seen_links = set(exclude_links) if exclude_links else set()
     full_log = []
     consecutive_empty_rounds = 0
@@ -1234,10 +1370,19 @@ def search_comparables_until_target(
     def t(id_text, en_text):
         return _t(lang, id_text, en_text)
 
+    # Semua pembanding yang dikembalikan agent SUDAH diverifikasi berada dalam radius
+    # (yang di luar radius / lokasinya tak terverifikasi dibuang di dalam agent).
+    # Prioritas: yang LT&LB-nya sesuai toleransi (luas_ok) lebih dulu; yang luasnya
+    # beda tapi masih di area yang sama dipakai sebagai pengisi.
+    def _n_sesuai():
+        return sum(1 for c in all_comps if c.get("luas_ok"))
+
     for round_no in range(1, max_rounds + 1):
-        remaining = target - len(all_comps)
-        if remaining <= 0:
+        # Berhenti kalau pembanding yang ukurannya sesuai sudah cukup; atau kalau total
+        # (termasuk yang luasnya berbeda) sudah cukup setelah 3 ronde mencari yang sesuai.
+        if _n_sesuai() >= target or (len(all_comps) >= target and round_no > 3):
             break
+        remaining = max(target - _n_sesuai(), 1)
         if progress_cb:
             progress_cb(round_no, len(all_comps), target)
         full_log.append(t(
@@ -1260,9 +1405,13 @@ def search_comparables_until_target(
             luas_tanah_toleransi_pct=luas_tanah_toleransi_pct,
             luas_bangunan_toleransi_pct=luas_bangunan_toleransi_pct,
             search_page=round_no,
+            query_variant=round_no,
+            rejected_links=rejected,
             lang=lang,
         )
         full_log.extend(log)
+        # Link yang sudah dicek tapi dibuang (di luar radius) jangan dicek ulang.
+        seen_links.update(rejected)
 
         n_new = 0
         for c in comps:
@@ -1279,14 +1428,18 @@ def search_comparables_until_target(
         else:
             consecutive_empty_rounds = 0
 
-        if consecutive_empty_rounds >= 2:
+        # Dengan filter radius ketat, satu halaman Google bisa saja isinya listing yang semuanya
+        # jauh (dibuang), sementara halaman berikutnya penuh listing dekat - jadi beri 3 ronde
+        # kosong berturut-turut sebelum menyerah (2 kalau tanpa filter radius).
+        _max_empty = 5 if (subjek_lat is not None and subjek_lon is not None) else 3
+        if consecutive_empty_rounds >= _max_empty:
             full_log.append(t(
-                "⚠ 2 ronde berturut-turut tidak menambah pembanding baru - "
+                f"⚠ {_max_empty} ronde berturut-turut tidak menambah pembanding baru - "
                 "kemungkinan besar listing publik yang tersedia di radius & "
                 "toleransi ini memang sudah habis. Menghentikan pencarian "
                 "otomatis (coba perbesar radius/toleransi kalau masih ingin "
                 "lebih banyak, atau tambahkan pembanding manual).",
-                "⚠ 2 consecutive rounds added no new comparables - the public "
+                f"⚠ {_max_empty} consecutive rounds added no new comparables - the public "
                 "listings available within this radius & tolerance are likely "
                 "exhausted. Stopping the automatic search (try widening the "
                 "radius/tolerance if you still want more, or add comparables "
@@ -1328,6 +1481,21 @@ def search_comparables_until_target(
             "duplicates of the same property (identical source+price+land+building area) "
             "despite having different URLs."))
     all_comps = deduped_comps
+
+    # Kembalikan PERSIS `target` (kalau tersedia): yang ukurannya sesuai dulu, lalu yang
+    # luasnya berbeda (tetap dalam radius), masing-masing diurutkan dari yang terdekat.
+    all_comps.sort(key=lambda c: (0 if c.get("luas_ok") else 1,
+                                   c.get("distance_km") if c.get("distance_km") is not None else 9e9))
+    if len(all_comps) > target:
+        all_comps = all_comps[:target]
+    if len(all_comps) < target:
+        full_log.append(t(
+            f"⚠ Hanya {len(all_comps)} dari {target} pembanding yang ditemukan DI DALAM radius {radius_km:g} km "
+            "(listing di luar radius sengaja tidak ditambahkan). Perbesar radius, longgarkan toleransi luas, "
+            "atau tambahkan pembanding manual.",
+            f"⚠ Only {len(all_comps)} of {target} comparables were found INSIDE the {radius_km:g} km radius "
+            "(listings outside the radius are intentionally not added). Widen the radius, loosen the area "
+            "tolerance, or add comparables manually."))
 
     return full_log, all_comps
 

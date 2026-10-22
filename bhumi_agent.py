@@ -422,6 +422,31 @@ Return raw JSON only. Do not wrap in markdown blocks.
             if extracted_text.strip():
                 result_json = self.clean_text_extraction(extracted_text)
 
+            # Simpan teks mentah popup (untuk diagnostik - lihat apa persis yang
+            # ditampilkan Bhumi) dan coba cari angka ZNT PRESISI dari respons
+            # jaringan yang tadi disadap (kalau ada dan cocok dengan kode zona).
+            try:
+                result_json["raw_popup_text"] = extracted_text.strip()[:1500]
+                exact, net_debug = extract_exact_znt_from_network(
+                    network_znt_data, result_json.get("kode_zona"),
+                    parse_rupiah(result_json.get("nilai_min")),
+                    parse_rupiah(result_json.get("nilai_max")),
+                )
+                result_json["nilai_exact"] = exact
+                self.log_step(self.t(
+                    f"Popup Bhumi: {result_json.get('nilai_min')} - {result_json.get('nilai_max')} "
+                    f"(respons jaringan disadap: {len(network_znt_data)})",
+                    f"Bhumi popup: {result_json.get('nilai_min')} - {result_json.get('nilai_max')} "
+                    f"(network responses captured: {len(network_znt_data)})"))
+                if exact:
+                    self.log_step(self.t(
+                        f"✓ Angka ZNT presisi ditemukan di data jaringan Bhumi: Rp {exact:,.0f}".replace(",", "."),
+                        f"✓ Precise ZNT value found in Bhumi network data: Rp {exact:,.0f}"))
+                elif net_debug:
+                    self.log_step(net_debug)
+            except Exception as e:
+                self.log_step(f"Precise-value extraction skipped: {e}")
+
             await browser.close()
             return result_json
 
@@ -512,6 +537,64 @@ def parse_standard_znt_fields(text):
 
     return data
 
+def extract_exact_znt_from_network(payloads, kode_zona, nilai_min, nilai_max):
+    """
+    Cari angka ZNT tunggal (bukan rentang) di respons JSON yang disadap dari
+    jaringan saat peta Bhumi dimuat. Hanya dipakai kalau ada TEPAT SATU angka
+    yang (a) berada di objek yang memuat kode zona yang sama dengan popup,
+    (b) berada di key bernama nilai/harga/znt (bukan min/max/range), dan
+    (c) jatuh di dalam rentang popup. Selain itu -> None (jangan menebak).
+    Return (nilai_atau_None, pesan_debug).
+    """
+    if not kode_zona or not payloads:
+        return None, ""
+    kz = str(kode_zona).strip().lower()
+    key_re = re.compile(r"(nilai|harga|znt)", re.I)
+    skip_re = re.compile(r"(min|max|range|rentang|tahun|kode|id)", re.I)
+    found = set()
+
+    def to_num(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            return parse_rupiah(v)
+        return None
+
+    def walk(o):
+        if isinstance(o, dict):
+            if any(isinstance(v, (str, int)) and str(v).strip().lower() == kz for v in o.values()):
+                for k, v in o.items():
+                    if key_re.search(str(k)) and not skip_re.search(str(k)):
+                        n = to_num(v)
+                        if n and n >= 1000:
+                            found.add(n)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    parsed_any = False
+    for text in payloads:
+        try:
+            walk(json.loads(text))
+            parsed_any = True
+        except Exception:
+            continue
+
+    lo = nilai_min if nilai_min is not None else 0
+    hi = nilai_max if nilai_max is not None else float("inf")
+    cands = sorted(v for v in found if lo * 0.999 <= v <= hi * 1.001)
+    if len(cands) == 1:
+        return cands[0], ""
+    if not parsed_any:
+        return None, "Network data captured but not JSON - only the popup range is available."
+    return None, (f"No single precise value in network data (candidates: {cands})"
+                  if cands else "No precise value in network data - only the popup range is available.")
+
+
 def parse_rupiah(value):
     """
     Parse strings like 'Rp 1.500.000', '1.500.000', '>3.000.000', 'Max', '0'
@@ -546,7 +629,10 @@ def map_bhumi_result_to_app_schema(bhumi_result: dict, lang: str = "id") -> dict
     nilai_min = parse_rupiah(bhumi_result.get("nilai_min"))
     nilai_max = parse_rupiah(bhumi_result.get("nilai_max"))
 
-    if nilai_min is not None and nilai_max is not None:
+    nilai_exact = parse_rupiah(bhumi_result.get("nilai_exact"))
+    if nilai_exact:
+        harga_znt_per_m2 = round(nilai_exact, 0)
+    elif nilai_min is not None and nilai_max is not None:
         harga_znt_per_m2 = round((nilai_min + nilai_max) / 2, 0)
     elif nilai_min is not None:
         harga_znt_per_m2 = nilai_min
@@ -588,14 +674,10 @@ def map_bhumi_result_to_app_schema(bhumi_result: dict, lang: str = "id") -> dict
         "tanggal_data": str(bhumi_result.get("tahun") or "-"),
         "confidence_level": confidence_level,
         "source_notes": source_notes,
-        # Nilai mentah band resmi (float atau None) - disertakan supaya caller
-        # (mis. run_znt_agent di agents.py) bisa menge-CLAMP estimasi titik
-        # yang lebih presisi (dari pencarian pasar riil) ke dalam batas
-        # resmi Bhumi ATR/BPN ini, tanpa perlu parse ulang string
-        # "zona_nilai_tanah" atau menyentuh nilai_min/nilai_max mentah yang
-        # formatnya belum tentu numerik bersih.
-        "nilai_min_num": nilai_min,
-        "nilai_max_num": nilai_max,
+        "nilai_min": nilai_min,
+        "nilai_max": nilai_max,
+        "nilai_exact": nilai_exact,
+        "raw_popup_text": bhumi_result.get("raw_popup_text", ""),
     }
 
 
