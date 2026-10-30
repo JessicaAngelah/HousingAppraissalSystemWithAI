@@ -79,10 +79,157 @@ Return raw JSON only. Do not wrap in markdown blocks.
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
-            return json.loads(response.text.strip())
+            ai = json.loads(response.text.strip())
+            if not isinstance(ai, dict):
+                raise ValueError("Gemini returned non-object JSON")
+            # Nilai dari parser regex (deterministik) diutamakan; Gemini hanya
+            # dipakai untuk mengisi yang kosong - jangan sampai Gemini yang
+            # mengembalikan null/format aneh menimpa hasil regex yang benar.
+            merged = parse_standard_znt_fields(text_context)
+            for k, v in ai.items():
+                if merged.get(k) in (None, "") and v not in (None, ""):
+                    merged[k] = v
+            return merged
         except Exception as e:
             self.log_step(f"AI parsing skipped/failed (using direct native values): {e}")
             return parse_standard_znt_fields(text_context)
+
+
+    async def _dump_buttons(self, page, limit=60):
+        """Tulis daftar tombol yang terlihat (teks/aria/data-umami-event/title) ke log,
+        supaya kelihatan persis UI Bhumi saat ini kalau selector gagal."""
+        try:
+            items = await page.evaluate("""() => Array.from(document.querySelectorAll('button, [role=button], a'))
+                .filter(e => e.offsetParent !== null)
+                .map(e => [e.tagName, (e.innerText||'').trim().slice(0,30), e.getAttribute('aria-label')||'',
+                           e.getAttribute('data-umami-event')||'', e.getAttribute('title')||'',
+                           (e.className && e.className.toString ? e.className.toString() : '').slice(0,40)])""")
+            self.log_step(f"[DEBUG] {len(items)} tombol terlihat:")
+            for it in items[:limit]:
+                self.log_step("[DEBUG] " + " | ".join(str(x) for x in it))
+        except Exception as e:
+            self.log_step(f"[DEBUG] gagal dump tombol: {e}")
+
+    async def _click_by_keyword(self, page, keywords):
+        """Klik elemen (tombol/link) pertama yang atribut/teksnya memuat salah satu kata kunci."""
+        return await page.evaluate("""(kws) => {
+            const els = Array.from(document.querySelectorAll('button, [role=button], a, li, div[class*=menu]'));
+            for (const e of els) {
+              const hay = ((e.innerText||'') + ' ' + (e.getAttribute('aria-label')||'') + ' ' +
+                           (e.getAttribute('data-umami-event')||'') + ' ' + (e.getAttribute('title')||'') + ' ' +
+                           (e.className||'')).toLowerCase();
+              if (kws.some(k => hay.includes(k)) && e.offsetParent !== null && (e.innerText||'').length < 60) {
+                e.click(); return true; }
+            }
+            return false; }""", [k.lower() for k in keywords])
+
+
+    async def _open_coordinate_dialog(self, page):
+        """Buka dialog 'Pencarian Koordinat'. UI Bhumi sudah berubah (tombol ikon tanpa
+        label), jadi: coba jalur lama dulu, lalu coba klik satu per satu tombol ikon /
+        tombol menu dan cek apakah muncul 'Pencarian Koordinat' atau input #longitude."""
+        lng_input = page.locator("#longitude").first
+
+        async def dialog_open():
+            try:
+                return await lng_input.is_visible()
+            except Exception:
+                return False
+
+        async def try_menu_item():
+            for loc in (page.locator(".intro-menukoordinat").first,
+                        page.get_by_text("Pencarian Koordinat").first):
+                try:
+                    if await loc.is_visible():
+                        await loc.click(timeout=3000)
+                        await page.wait_for_timeout(800)
+                        if await dialog_open():
+                            return True
+                except Exception:
+                    pass
+            return await dialog_open()
+
+        if await dialog_open():
+            return True
+
+        # a) jalur lama (ikon SVG 'M 19 3')
+        try:
+            old_btn = page.locator("button").filter(has=page.locator("path[d*='M 19 3']")).first
+            if await old_btn.count() > 0:
+                await old_btn.click(timeout=3000)
+                await page.wait_for_timeout(800)
+                if await try_menu_item():
+                    return True
+        except Exception:
+            pass
+
+        # a2) UI baru: menu samping -> tombol "Pencarian" -> "Pencarian Koordinat"
+        try:
+            pencarian = page.locator("button").filter(has_text=re.compile(r"^\s*Pencarian\s*$")).first
+            if not await pencarian.is_visible():
+                menu_toggle = page.locator("button[title='Buka Menu']").first
+                if await menu_toggle.count() > 0:
+                    await menu_toggle.click(force=True, timeout=3000)
+                    await page.wait_for_timeout(1000)
+            if await pencarian.is_visible():
+                await pencarian.click(timeout=3000)
+                await page.wait_for_timeout(1200)
+                self.log_step("Menu 'Pencarian' dibuka.")
+                if await try_menu_item():
+                    return True
+                # mungkin ada tab/opsi 'Koordinat' di panel pencarian
+                for loc in (page.get_by_text("Koordinat", exact=True).first,
+                            page.get_by_text(re.compile(r"koordinat", re.I)).first):
+                    try:
+                        if await loc.is_visible():
+                            await loc.click(timeout=3000)
+                            await page.wait_for_timeout(1000)
+                            if await dialog_open():
+                                return True
+                    except Exception:
+                        pass
+                try:
+                    body = await page.locator("body").inner_text(timeout=3000)
+                    self.log_step("[DEBUG] teks halaman setelah klik Pencarian: " + body[:700].replace("\n", " | "))
+                except Exception:
+                    pass
+            else:
+                self.log_step("[DEBUG] tombol 'Pencarian' tidak terlihat di menu samping.")
+        except Exception as e:
+            self.log_step(f"[DEBUG] jalur menu Pencarian gagal: {e}")
+
+        # b) tombol ikon tanpa teks (UI baru) + tombol menu lain
+        handles = await page.query_selector_all("button")
+        cands = []
+        for h in handles:
+            try:
+                if not await h.is_visible():
+                    continue
+                info = await h.evaluate("""e => [(e.innerText||'').trim(), e.getAttribute('title')||'',
+                                                  e.getAttribute('aria-label')||'']""")
+                txt, title, aria = info
+                label = (title or aria or txt).lower()
+                skip = ("tutup", "masuk", "rating", "reset utara", "tampilan 3d", "bangunan 3d",
+                        "lokasi saya", "analisis", "google maps", "ulasan", "favorit",
+                        "toggle attribution", "meja kerja", "katalog", "layers")
+                if any(s in label for s in skip):
+                    continue
+                cands.append(h)
+            except Exception:
+                continue
+        self.log_step(f"Mencari tombol pencarian koordinat: {len(cands)} kandidat...")
+        for n, h in enumerate(cands):
+            try:
+                await h.click(timeout=2000)
+                await page.wait_for_timeout(700)
+                if await try_menu_item():
+                    self.log_step(f"Dialog koordinat terbuka lewat kandidat #{n + 1}.")
+                    return True
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(300)
+            except Exception:
+                continue
+        return False
 
     async def _try_point(self, page, lat, lng, label=""):
         """
@@ -101,17 +248,9 @@ Return raw JSON only. Do not wrap in markdown blocks.
 
         # 4. Search and center on coordinate
         try:
-            # 4.1 Press coordinate dropdown trigger button containing search map pin SVG path "M 19 3"
-            trigger_btn = page.locator("button").filter(has=page.locator("path[d*='M 19 3']")).first
-            await trigger_btn.click()
-            await page.wait_for_timeout(1000)
-
-            # 4.2 Click "Pencarian Koordinat" option
-            coord_menu_item = page.locator(".intro-menukoordinat").first
-            if not await coord_menu_item.is_visible():
-                coord_menu_item = page.get_by_text("Pencarian Koordinat").first
-            await coord_menu_item.click()
-            await page.wait_for_timeout(1000)
+            if not await self._open_coordinate_dialog(page):
+                await self._dump_buttons(page)
+                raise RuntimeError("Tombol pencarian koordinat tidak ditemukan di UI Bhumi (lihat daftar [DEBUG] di atas)")
 
             # 4.3 Fill in Longitude
             longitude_input = page.locator("#longitude").first
@@ -129,6 +268,8 @@ Return raw JSON only. Do not wrap in markdown blocks.
             await page.wait_for_timeout(5000)
         except Exception as e:
             self.log_step(f"Coordinate search automation failed{suffix}: {e}")
+            if "tidak ditemukan di UI" in str(e):
+                self._ui_broken = True
             return ""
 
         # 5. Click the routing marker to reveal the popup details
@@ -195,6 +336,20 @@ Return raw JSON only. Do not wrap in markdown blocks.
                         extracted_text += "\n" + txt.strip()
             except:
                 pass
+        # Fallback: kalau selector popup tidak menangkap apa-apa (class CSS Bhumi
+        # berubah), ambil teks seluruh halaman dan ambil bagian yang memuat label ZNT.
+        if not any(k in extracted_text for k in ("Nomor Zone", "Range Nilai", "Kode Zona")):
+            try:
+                body = await page.locator("body").inner_text(timeout=5000)
+                idx = body.find("Nomor Zone")
+                if idx == -1:
+                    idx = body.find("Range Nilai")
+                if idx != -1:
+                    extracted_text += "\n" + body[max(0, idx - 200): idx + 800]
+                    self.log_step(self.t("Popup tidak terbaca lewat selector - memakai teks halaman.",
+                                         "Popup not readable via selectors - using page text."))
+            except Exception:
+                pass
         return extracted_text
 
     async def run(self):
@@ -243,6 +398,8 @@ Return raw JSON only. Do not wrap in markdown blocks.
                         raise e
                 else:
                     raise
+            # Pakai pengaturan browser default (1280x720) - ini yang sebelumnya terbukti
+            # cocok dengan tata letak tombol Bhumi; jangan diubah tanpa tes.
             page = await browser.new_page()
             
             # Intercept network responses in case we catch raw ZNT data
@@ -258,7 +415,17 @@ Return raw JSON only. Do not wrap in markdown blocks.
             page.on("response", handle_response)
 
             self.log_step("Navigating to Bhumi ATR/BPN...")
-            await page.goto("https://bhumi.atrbpn.go.id/peta", timeout=60000)
+            try:
+                await page.goto("https://bhumi.atrbpn.go.id/peta", timeout=60000)
+            except Exception as e:
+                await browser.close()
+                if "ERR_NAME_NOT_RESOLVED" in str(e) or "ERR_INTERNET_DISCONNECTED" in str(e):
+                    raise RuntimeError(self.t(
+                        "Komputer/server ini tidak bisa menjangkau bhumi.atrbpn.go.id (DNS gagal). "
+                        "Cek internet/VPN/proxy, atau buka https://bhumi.atrbpn.go.id/peta di browser biasa.",
+                        "This machine/server cannot reach bhumi.atrbpn.go.id (DNS failure). "
+                        "Check internet/VPN/proxy, or open https://bhumi.atrbpn.go.id/peta in a normal browser."))
+                raise
             await page.wait_for_timeout(3000)
 
             # 1. Handle Legal Disclaimer Pop-up
@@ -291,6 +458,12 @@ Return raw JSON only. Do not wrap in markdown blocks.
             # 3. Enable Zona Nilai Tanah Layer
             self.log_step("Enabling Zona Nilai Tanah (ZNT) layer...")
             try:
+                # UI baru: tombol katalog punya title 'Buka Katalog Data'
+                new_katalog = page.locator("button[title='Buka Katalog Data']").first
+                if await new_katalog.count() > 0 and await new_katalog.is_visible():
+                    await new_katalog.click()
+                    self.log_step("Opened data catalog dialog (new UI).")
+                    await page.wait_for_timeout(2500)
                 # Open Sidebar Menu
                 menu_btn = page.locator("button:has-text('Menu'), .menu-toggle, #menu-btn").first
                 if await menu_btn.is_visible():
@@ -340,6 +513,9 @@ Return raw JSON only. Do not wrap in markdown blocks.
             except Exception as e:
                 self.log_step(f"Error while enabling layer standard UI logic: {e}")
 
+            await page.screenshot(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "bhumi_debug.png"))
+            self.log_step("Screenshot disimpan: bhumi_debug.png (di folder app)")
+
             # 3.5 STRICT CLOSE ROUTINE FOR MODAL DISMISSAL
             self.log_step("Ensuring Katalog Data modal is closed...")
             modal_closed = False
@@ -364,6 +540,8 @@ Return raw JSON only. Do not wrap in markdown blocks.
 
             if not modal_closed:
                 self.log_step("Modal remains open. Forcing close by clicking off-screen...")
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(800)
                 await page.mouse.click(10, 10)
                 await page.wait_for_timeout(1500)
 
@@ -395,6 +573,8 @@ Return raw JSON only. Do not wrap in markdown blocks.
             extracted_text = ""
             for i, (dlat, dlng, label) in enumerate(offsets):
                 text = await self._try_point(page, self.lat + dlat, self.lng + dlng, label=label)
+                if i == 0 and getattr(self, "_ui_broken", False):
+                    break
                 parsed_probe = parse_standard_znt_fields(text)
                 extracted_text = text
                 if parsed_probe.get("kode_zona") or parsed_probe.get("nilai_min") or parsed_probe.get("nilai_max"):
@@ -447,6 +627,16 @@ Return raw JSON only. Do not wrap in markdown blocks.
             except Exception as e:
                 self.log_step(f"Precise-value extraction skipped: {e}")
 
+            if not (result_json.get("kode_zona") or result_json.get("nilai_min") or result_json.get("nilai_max")):
+                try:
+                    result_json["debug_screenshot"] = await page.screenshot(type="png")
+                except Exception:
+                    pass
+                try:
+                    result_json["debug_body_text"] = (await page.locator("body").inner_text(timeout=3000))[:1500]
+                except Exception:
+                    pass
+
             await browser.close()
             return result_json
 
@@ -479,6 +669,12 @@ def parse_standard_znt_fields(text):
         "Tambahkan ke Koleksi", "Koordinat", "Rating", "Informasi data layer",
     ]
     boundary = "|".join(re.escape(l) for l in NEXT_LABELS)
+
+    # Popup UI baru memberi format berbaris ("Nomor Zone\n: 468\nTahun Dibuat\n: 2026").
+    # Rapikan jadi satu baris "Label: nilai Label: nilai" supaya regex di bawah cocok
+    # untuk format lama (tanpa spasi) maupun format baru (per baris).
+    text = re.sub(r"\s*\n\s*:\s*", ": ", text or "")
+    text = re.sub(r"\s*\n\s*", " ", text)
 
     def bounded(label_pattern):
         m = re.search(rf"{label_pattern}\s*:\s*(.+?)(?=(?:{boundary})|$)", text, re.IGNORECASE)
@@ -690,24 +886,15 @@ def run_bhumi_znt_sync(lat, lng, headed=False, api_key=None, log_callback=None, 
     """
     agent = BhumiZntAgent(lat=lat, lng=lng, headed=headed, api_key=api_key,
                            log_callback=log_callback, lang=lang)
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+    # Selalu jalankan di thread sendiri dengan event loop baru - menghindari
+    # konflik dengan event loop Streamlit/Tornado (terutama di Windows).
+    import concurrent.futures
 
-    if loop and loop.is_running():
-        # We're already inside an event loop (rare for Streamlit's main script
-        # thread, but can happen with some setups) - run in a fresh thread
-        # with its own loop instead of nesting asyncio.run().
-        import concurrent.futures
+    def _runner():
+        return asyncio.run(agent.run())
 
-        def _runner():
-            return asyncio.run(agent.run())
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(_runner).result()
-
-    return asyncio.run(agent.run())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(_runner).result()
 
 
 if __name__ == "__main__":
